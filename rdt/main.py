@@ -37,6 +37,12 @@ def parse_args(input_args=None):
         default=None,
         help="Pretrained vision language model name or path if not the same as model_name",
     )
+    parser.add_argument(
+        "--processor_name_or_path",
+        type=str,
+        default="Qwen/Qwen2.5-VL-7B-Instruct",
+        help="Processor name or path for the vision-language model.",
+    )
 
     parser.add_argument(
         "--output_dir",

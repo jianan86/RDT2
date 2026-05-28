@@ -1,0 +1,6 @@
+name: shard10_rdt2_fm
+type: single
+shards_dir: /data/jianan/rdt2
+kwargs:
+  instruction_path: /data/jianan/rdt2/instructions.json
+  normalizer_path: /data/jianan/rdt2/RVQActionTokenizer/umi_normalizer_wo_downsample_indentity_rot.pt

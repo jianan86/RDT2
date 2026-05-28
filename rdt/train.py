@@ -124,7 +124,7 @@ def train(args, logger):
         weight_dtype = torch.bfloat16
 
     processor = AutoProcessor.from_pretrained(
-        "Qwen/Qwen2.5-VL-7B-Instruct",
+        args.processor_name_or_path,
         padding_side="left",
         use_fast=True,
     )  
