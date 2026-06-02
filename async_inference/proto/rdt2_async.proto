@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package rdt2.async_inference;
+
+service RDT2AsyncInference {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Reset(ResetRequest) returns (ResetResponse);
+  rpc SubmitObservation(ObservationRequest) returns (ObservationAck);
+  rpc StreamActions(ActionStreamRequest) returns (stream ActionChunk);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;
+  string message = 2;
+}
+
+message ResetRequest {}
+
+message ResetResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message ObservationRequest {
+  int64 request_id = 1;
+  double timestamp = 2;
+  string instruction = 3;
+  bytes left_stereo_jpeg = 4;
+  bytes right_stereo_jpeg = 5;
+  repeated float state = 6;
+  repeated float eef_pose_flat = 7;
+  int64 latest_executed_timestep = 8;
+}
+
+message ObservationAck {
+  int64 request_id = 1;
+  bool accepted = 2;
+  string message = 3;
+}
+
+message ActionStreamRequest {}
+
+message ActionChunk {
+  int64 request_id = 1;
+  double created_timestamp = 2;
+  repeated float action_flat = 3;
+  int32 horizon = 4;
+  int32 action_dim = 5;
+  double inference_latency_ms = 6;
+  string error = 7;
+  int64 first_timestep = 8;
+}
