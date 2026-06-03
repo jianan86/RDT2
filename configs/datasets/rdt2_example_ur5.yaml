@@ -1,0 +1,6 @@
+name: rdt2/rdt2_example_ur5
+type: single
+shards_dir: /data/jianan/data/rdt2_example_ur5
+kwargs:
+  instruction_path: /data/jianan/data/rdt2_example_ur5/instructions.json
+  normalizer_path: /data/jianan/rdt2/RVQActionTokenizer/umi_normalizer_wo_downsample_indentity_rot.pt

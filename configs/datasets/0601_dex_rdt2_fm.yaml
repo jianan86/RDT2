@@ -1,6 +1,0 @@
-name: pika/0601_dex_rdt2_fm
-type: single
-shards_dir: /home/jianan/workspace/data/0601_dex_rdt2_fm
-kwargs:
-  instruction_path: /home/jianan/workspace/data/0601_dex_rdt2_fm/instructions.json
-  normalizer_path: /home/jianan/Downloads/rdt2/RVQActionTokenizer/umi_normalizer_wo_downsample_indentity_rot.pt
