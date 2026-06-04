@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import shutil
+import sys
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,13 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageOps
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data.umi.common.pose_repr_util import convert_pose_mat_rep
+from data.umi.pose_util import mat_to_pose10d
 
 
 DEFAULT_INPUT_ROOT = Path("/home/jianan/workspace/data/0601_dex")
@@ -111,6 +119,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--horizon", type=int, default=24)
     parser.add_argument("--max-sync-delta-sec", type=float, default=0.02)
+    parser.add_argument("--gripper-input-max", type=float, default=0.1)
+    parser.add_argument("--gripper-output-max", type=float, default=0.088)
     parser.add_argument("--samples-per-shard", type=int, default=10000)
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--max-samples", type=int)
@@ -137,7 +147,7 @@ def load_synced_files(directory: Path) -> list[TimedFile]:
 
     if not files:
         raise ValueError(f"No files listed in sync file: {sync_path}")
-    return files
+    return sorted(files, key=lambda item: item.timestamp)
 
 
 def timestamp_from_path(path: Path) -> float:
@@ -221,17 +231,22 @@ def load_pose_matrix(path: Path) -> np.ndarray:
     return mat
 
 
-def load_gripper_width(path: Path) -> np.float32:
+def load_gripper_width(path: Path, *, input_max: float, output_max: float) -> np.float32:
     with path.open() as f:
         payload = json.load(f)
-    return np.float32(payload["distance"])
+    width = float(payload["distance"])
+    if input_max <= 0:
+        raise ValueError(f"gripper_input_max must be positive, got {input_max}")
+    width = width / input_max * output_max
+    return np.float32(np.clip(width, 0.0, output_max))
 
 
 def euler_xyz_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    matrix = np.eye(3, dtype=np.float32)
-    for axis, angle in zip(("x", "y", "z"), (roll, pitch, yaw), strict=True):
-        matrix = matrix @ rotation_about_axis(axis, angle)
-    return matrix.astype(np.float32, copy=False)
+    return (
+        rotation_about_axis("z", yaw)
+        @ rotation_about_axis("y", pitch)
+        @ rotation_about_axis("x", roll)
+    ).astype(np.float32, copy=False)
 
 
 def rotation_about_axis(axis: str, angle: float) -> np.ndarray:
@@ -246,23 +261,36 @@ def rotation_about_axis(axis: str, angle: float) -> np.ndarray:
     raise ValueError(f"Unsupported axis: {axis}")
 
 
-def mat_to_rot6d(mat: np.ndarray) -> np.ndarray:
-    return np.concatenate((mat[:3, 0], mat[:3, 1]), axis=0).astype(np.float32, copy=False)
 
-
-def pose_mat_to_pose9d(mat: np.ndarray) -> np.ndarray:
-    return np.concatenate((mat[:3, 3], mat_to_rot6d(mat)), axis=0).astype(np.float32, copy=False)
-
-
-def build_robot_action(base: MatchedFrame, future_frames: list[MatchedFrame]) -> np.ndarray:
+def build_robot_action(
+    base: MatchedFrame,
+    future_frames: list[MatchedFrame],
+    *,
+    gripper_input_max: float,
+    gripper_output_max: float,
+) -> np.ndarray:
     base_pose = load_pose_matrix(base.pose)
-    inv_base_pose = np.linalg.inv(base_pose).astype(np.float32, copy=False)
     actions = []
     for frame in future_frames:
         future_pose = load_pose_matrix(frame.pose)
-        relative_pose = inv_base_pose @ future_pose
-        gripper = np.asarray([load_gripper_width(frame.gripper)], dtype=np.float32)
-        actions.append(np.concatenate((pose_mat_to_pose9d(relative_pose), gripper), axis=0))
+        relative_pose = convert_pose_mat_rep(
+            future_pose[None],
+            base_pose_mat=base_pose,
+            pose_rep="relative",
+            backward=False,
+        )[0]
+        gripper = np.asarray(
+            [
+                load_gripper_width(
+                    frame.gripper,
+                    input_max=gripper_input_max,
+                    output_max=gripper_output_max,
+                )
+            ],
+            dtype=np.float32,
+        )
+        pose10d = mat_to_pose10d(relative_pose).astype(np.float32, copy=False)
+        actions.append(np.concatenate((pose10d, gripper), axis=0))
     return np.stack(actions, axis=0).astype(np.float32, copy=False)
 
 
@@ -271,9 +299,22 @@ def build_action(
     left_base: MatchedFrame,
     right_future: list[MatchedFrame],
     left_future: list[MatchedFrame],
+    *,
+    gripper_input_max: float,
+    gripper_output_max: float,
 ) -> np.ndarray:
-    right_action = build_robot_action(right_base, right_future)
-    left_action = build_robot_action(left_base, left_future)
+    right_action = build_robot_action(
+        right_base,
+        right_future,
+        gripper_input_max=gripper_input_max,
+        gripper_output_max=gripper_output_max,
+    )
+    left_action = build_robot_action(
+        left_base,
+        left_future,
+        gripper_input_max=gripper_input_max,
+        gripper_output_max=gripper_output_max,
+    )
     return np.concatenate((right_action, left_action), axis=1).astype(np.float32, copy=False)
 
 
@@ -325,10 +366,10 @@ def write_json(path: Path, payload: Any) -> None:
         f.write("\n")
 
 
-def write_dataset_config(output_root: Path, normalizer_path: Path) -> Path:
-    config_path = output_root / "0601_dex_rdt2_fm.yaml"
+def write_dataset_config(output_root: Path, dataset_name: str, normalizer_path: Path) -> Path:
+    config_path = output_root / f"{dataset_name}.yaml"
     config = (
-        "name: pika/0601_dex_rdt2_fm\n"
+        f"name: pika/{dataset_name}\n"
         "type: single\n"
         f"shards_dir: {output_root}\n"
         "kwargs:\n"
@@ -340,9 +381,14 @@ def write_dataset_config(output_root: Path, normalizer_path: Path) -> Path:
 
 
 def convert(args: argparse.Namespace) -> dict[str, Any]:
+    dataset_name = f"rdt2_fm_{args.input_root.name}"
+    instruction_key = args.instruction_key
+    if instruction_key == DEFAULT_INSTRUCTION_KEY:
+        instruction_key = f"{args.input_root.name}/{DEFAULT_INSTRUCTION_KEY.split('/', 1)[1]}"
+
     prepare_output_root(args.output_root, args.overwrite)
-    write_json(args.output_root / "instructions.json", {args.instruction_key: args.instruction})
-    config_path = write_dataset_config(args.output_root, args.normalizer_path)
+    write_json(args.output_root / "instructions.json", {instruction_key: args.instruction})
+    config_path = write_dataset_config(args.output_root, dataset_name, args.normalizer_path)
 
     episodes = discover_episode_dirs(args.input_root)
     if args.max_episodes is not None:
@@ -352,7 +398,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
     skipped_sync = 0
     skipped_horizon = 0
     converted_by_episode: dict[str, int] = {}
-    meta = {"sub_task_instruction_key": args.instruction_key}
+    meta = {"sub_task_instruction_key": instruction_key}
 
     with ShardWriter(args.output_root, args.samples_per_shard) as writer:
         for episode_dir in episodes:
@@ -404,6 +450,8 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                     left_base=left_future[0],
                     right_future=right_future,
                     left_future=left_future,
+                    gripper_input_max=args.gripper_input_max,
+                    gripper_output_max=args.gripper_output_max,
                 )
                 writer.write_sample(sample_id, image=image, action=action, meta=meta)
                 sample_id += 1
@@ -418,11 +466,14 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         "input_root": str(args.input_root),
         "output_root": str(args.output_root),
         "dataset_config": str(config_path),
-        "instruction_key": args.instruction_key,
+        "dataset_name": dataset_name,
+        "instruction_key": instruction_key,
         "instruction": args.instruction,
         "fps": args.fps,
         "horizon": args.horizon,
         "max_sync_delta_sec": args.max_sync_delta_sec,
+        "gripper_input_max": args.gripper_input_max,
+        "gripper_output_max": args.gripper_output_max,
         "samples_per_shard": args.samples_per_shard,
         "total_samples": sample_id,
         "skipped_sync_windows": skipped_sync,
