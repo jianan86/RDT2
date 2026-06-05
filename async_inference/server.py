@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import queue
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 from concurrent import futures
 from dataclasses import dataclass
 
-import cv2
 import grpc
 import numpy as np
 
@@ -42,136 +38,17 @@ class QueuedObservation:
     latest_executed_timestep: int
 
 
-class LatestImageViewer:
-    def __init__(self, window_name: str):
-        self.window_name = window_name
-        self.queue: queue.Queue[tuple[bytes, bytes, int, float]] = queue.Queue(maxsize=1)
-        self.stop_event = threading.Event()
-        self.window_created = False
-        self.thread = threading.Thread(target=self._loop, name="rdt2-input-image-viewer", daemon=True)
-        self.thread.start()
-
-    def submit(self, left_jpeg: bytes, right_jpeg: bytes, request_id: int, timestamp: float) -> None:
-        if self.stop_event.is_set():
-            return
-        item = (left_jpeg, right_jpeg, request_id, timestamp)
-        while not self.stop_event.is_set():
-            try:
-                self.queue.put_nowait(item)
-                return
-            except queue.Full:
-                try:
-                    self.queue.get_nowait()
-                except queue.Empty:
-                    pass
-
-    def close(self) -> None:
-        self.stop_event.set()
-        self.thread.join(timeout=2.0)
-
-    def _loop(self) -> None:
-        try:
-            if self._is_headless_linux():
-                print("[server] warning: input image viewer disabled: no DISPLAY or WAYLAND_DISPLAY")
-                self.stop_event.set()
-                return
-
-            while not self.stop_event.is_set():
-                try:
-                    left_jpeg, right_jpeg, request_id, timestamp = self.queue.get(timeout=0.2)
-                except queue.Empty:
-                    self._wait_key()
-                    continue
-
-                try:
-                    image = self._make_display_image(left_jpeg, right_jpeg, request_id, timestamp)
-                    cv2.imshow(self.window_name, image)
-                    self.window_created = True
-                    if self._wait_key() == ord("q"):
-                        self.stop_event.set()
-                except Exception as exc:
-                    print(f"[server] warning: input image viewer stopped: {exc}")
-                    self.stop_event.set()
-        finally:
-            if self.window_created:
-                try:
-                    cv2.destroyWindow(self.window_name)
-                except cv2.error as exc:
-                    print(f"[server] warning: input image viewer destroyWindow failed: {exc}")
-
-    def _wait_key(self) -> int:
-        try:
-            return cv2.waitKey(1) & 0xFF
-        except cv2.error as exc:
-            print(f"[server] warning: input image viewer waitKey failed: {exc}")
-            self.stop_event.set()
-            return -1
-
-    @staticmethod
-    def _make_display_image(left_jpeg: bytes, right_jpeg: bytes, request_id: int, timestamp: float) -> np.ndarray:
-        left = decode_jpeg(left_jpeg)
-        right = decode_jpeg(right_jpeg)
-        if left.shape[0] != right.shape[0]:
-            scale = left.shape[0] / right.shape[0]
-            right = cv2.resize(right, (max(1, int(right.shape[1] * scale)), left.shape[0]))
-        image = np.concatenate([left, right], axis=1)
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        label = f"request_id={request_id} timestamp={timestamp:.3f}"
-        cv2.putText(image, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(image, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
-        return image
-
-    @staticmethod
-    def _is_headless_linux() -> bool:
-        return sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-    @classmethod
-    def gui_available(cls) -> bool:
-        if cls._is_headless_linux():
-            print("[server] warning: input image viewer disabled: no DISPLAY or WAYLAND_DISPLAY")
-            return False
-
-        code = (
-            "import cv2, numpy as np; "
-            "img = np.zeros((16, 16, 3), dtype=np.uint8); "
-            "cv2.imshow('__rdt2_gui_probe__', img); "
-            "cv2.waitKey(1); "
-            "cv2.destroyWindow('__rdt2_gui_probe__')"
-        )
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", code],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=5.0,
-                check=False,
-            )
-        except Exception as exc:
-            print(f"[server] warning: input image viewer disabled: OpenCV GUI probe failed: {exc}")
-            return False
-
-        if result.returncode != 0:
-            detail = result.stderr.decode(errors="replace").strip().splitlines()[:3]
-            suffix = f": {' | '.join(detail)}" if detail else ""
-            print(f"[server] warning: input image viewer disabled: OpenCV GUI probe exited {result.returncode}{suffix}")
-            return False
-        return True
-
-
 class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
     def __init__(
         self,
         policy,
-        image_viewer: LatestImageViewer | None = None,
+        save_input_images: bool = False,
         debug_image_dir: str = "",
-        debug_image_limit: int = 20,
-        debug_image_every: int = 1,
     ):
         self.policy = policy
-        self.image_viewer = image_viewer
+        self.save_input_images = save_input_images
         self.debug_image_dir = debug_image_dir
-        self.debug_image_limit = debug_image_limit
-        self.debug_image_every = max(1, int(debug_image_every))
+        self.saved_first_input_images = False
         self.observation_queue: queue.Queue[QueuedObservation] = queue.Queue(maxsize=1)
         self.action_queue: queue.Queue[rdt2_async_pb2.ActionChunk] = queue.Queue()
         self.stop_event = threading.Event()
@@ -203,14 +80,7 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
             tcp_pose_flat=list(request.tcp_pose_flat),
             latest_executed_timestep=request.latest_executed_timestep,
         )
-        if self.image_viewer is not None:
-            self.image_viewer.submit(
-                item.left_stereo_jpeg,
-                item.right_stereo_jpeg,
-                item.request_id,
-                item.timestamp,
-            )
-        self._save_debug_images(item)
+        self._save_input_images(item)
         self._put_latest(self.observation_queue, item)
         print(
             f"[server] accepted observation request_id={item.request_id} "
@@ -222,20 +92,20 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
             message="queued latest observation",
         )
 
-    def _save_debug_images(self, item: QueuedObservation) -> None:
-        if not self.debug_image_dir:
+    def _save_input_images(self, item: QueuedObservation) -> None:
+        if not self.save_input_images:
             return
-        if item.request_id % self.debug_image_every != 0:
-            return
-        if self.debug_image_limit > 0 and item.request_id > self.debug_image_limit * self.debug_image_every:
+        should_save = not self.saved_first_input_images or item.request_id % 10 == 0
+        if not should_save:
             return
 
         base = Path(self.debug_image_dir)
         try:
-            save_rgb_png(base / f"request_{item.request_id:06d}_left_server.png", decode_jpeg(item.left_stereo_jpeg))
-            save_rgb_png(base / f"request_{item.request_id:06d}_right_server.png", decode_jpeg(item.right_stereo_jpeg))
+            save_rgb_png(base / "input_left_server.png", decode_jpeg(item.left_stereo_jpeg))
+            save_rgb_png(base / "input_right_server.png", decode_jpeg(item.right_stereo_jpeg))
+            self.saved_first_input_images = True
         except Exception as exc:
-            print(f"[server] warning: failed to save debug images request_id={item.request_id}: {exc}")
+            print(f"[server] warning: failed to save input images request_id={item.request_id}: {exc}")
 
 
     def StreamActions(self, request, context):
@@ -352,15 +222,13 @@ def serve(args) -> None:
     except Exception as exc:
         policy = FailedPolicy(f"policy load failed: {exc}")
         print(f"[server] {policy.error}")
-    image_viewer = None
-    if args.visualize_input_images and LatestImageViewer.gui_available():
-        image_viewer = LatestImageViewer(args.visualize_window_name)
+    debug_image_dir = args.debug_image_dir
+    if args.save_input_images and not debug_image_dir:
+        debug_image_dir = "debug_images"
     service = RDT2AsyncService(
         policy,
-        image_viewer=image_viewer,
-        debug_image_dir=args.debug_image_dir,
-        debug_image_limit=args.debug_image_limit,
-        debug_image_every=args.debug_image_every,
+        save_input_images=args.save_input_images,
+        debug_image_dir=debug_image_dir,
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=args.grpc_workers))
     rdt2_async_pb2_grpc.add_RDT2AsyncInferenceServicer_to_server(service, server)
@@ -374,8 +242,6 @@ def serve(args) -> None:
         print("[server] shutting down")
     finally:
         service.shutdown()
-        if image_viewer is not None:
-            image_viewer.close()
         server.stop(grace=1.0)
 
 
@@ -397,11 +263,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--compile-model", action="store_true", help="opt in to torch.compile for the RDT policy")
     parser.add_argument("--no-compile", action="store_true", help="kept for compatibility; compile is disabled by default")
-    parser.add_argument("--visualize-input-images", action="store_true", help="show the latest submitted left/right input images")
-    parser.add_argument("--visualize-window-name", default="RDT2 Async Input Images")
+    parser.add_argument("--save-input-images", action="store_true", help="save submitted left/right input images")
     parser.add_argument("--debug-image-dir", default="")
-    parser.add_argument("--debug-image-limit", default=20, type=int)
-    parser.add_argument("--debug-image-every", default=1, type=int)
     return parser.parse_args()
 
 
