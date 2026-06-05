@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from concurrent import futures
 from dataclasses import dataclass
 
@@ -13,7 +15,7 @@ import cv2
 import grpc
 import numpy as np
 
-from async_inference.codec import decode_jpeg, flatten_action
+from async_inference.codec import decode_jpeg, flatten_action, save_rgb_png
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
 from async_inference.rdt2_policy import (
     ABS_EEF_DIM,
@@ -123,11 +125,53 @@ class LatestImageViewer:
     def _is_headless_linux() -> bool:
         return sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
+    @classmethod
+    def gui_available(cls) -> bool:
+        if cls._is_headless_linux():
+            print("[server] warning: input image viewer disabled: no DISPLAY or WAYLAND_DISPLAY")
+            return False
+
+        code = (
+            "import cv2, numpy as np; "
+            "img = np.zeros((16, 16, 3), dtype=np.uint8); "
+            "cv2.imshow('__rdt2_gui_probe__', img); "
+            "cv2.waitKey(1); "
+            "cv2.destroyWindow('__rdt2_gui_probe__')"
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=5.0,
+                check=False,
+            )
+        except Exception as exc:
+            print(f"[server] warning: input image viewer disabled: OpenCV GUI probe failed: {exc}")
+            return False
+
+        if result.returncode != 0:
+            detail = result.stderr.decode(errors="replace").strip().splitlines()[:3]
+            suffix = f": {' | '.join(detail)}" if detail else ""
+            print(f"[server] warning: input image viewer disabled: OpenCV GUI probe exited {result.returncode}{suffix}")
+            return False
+        return True
+
 
 class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
-    def __init__(self, policy, image_viewer: LatestImageViewer | None = None):
+    def __init__(
+        self,
+        policy,
+        image_viewer: LatestImageViewer | None = None,
+        debug_image_dir: str = "",
+        debug_image_limit: int = 20,
+        debug_image_every: int = 1,
+    ):
         self.policy = policy
         self.image_viewer = image_viewer
+        self.debug_image_dir = debug_image_dir
+        self.debug_image_limit = debug_image_limit
+        self.debug_image_every = max(1, int(debug_image_every))
         self.observation_queue: queue.Queue[QueuedObservation] = queue.Queue(maxsize=1)
         self.action_queue: queue.Queue[rdt2_async_pb2.ActionChunk] = queue.Queue()
         self.stop_event = threading.Event()
@@ -166,6 +210,7 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
                 item.request_id,
                 item.timestamp,
             )
+        self._save_debug_images(item)
         self._put_latest(self.observation_queue, item)
         print(
             f"[server] accepted observation request_id={item.request_id} "
@@ -176,6 +221,22 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
             accepted=True,
             message="queued latest observation",
         )
+
+    def _save_debug_images(self, item: QueuedObservation) -> None:
+        if not self.debug_image_dir:
+            return
+        if item.request_id % self.debug_image_every != 0:
+            return
+        if self.debug_image_limit > 0 and item.request_id > self.debug_image_limit * self.debug_image_every:
+            return
+
+        base = Path(self.debug_image_dir)
+        try:
+            save_rgb_png(base / f"request_{item.request_id:06d}_left_server.png", decode_jpeg(item.left_stereo_jpeg))
+            save_rgb_png(base / f"request_{item.request_id:06d}_right_server.png", decode_jpeg(item.right_stereo_jpeg))
+        except Exception as exc:
+            print(f"[server] warning: failed to save debug images request_id={item.request_id}: {exc}")
+
 
     def StreamActions(self, request, context):
         print("[server] action stream connected")
@@ -292,9 +353,15 @@ def serve(args) -> None:
         policy = FailedPolicy(f"policy load failed: {exc}")
         print(f"[server] {policy.error}")
     image_viewer = None
-    if args.visualize_input_images:
+    if args.visualize_input_images and LatestImageViewer.gui_available():
         image_viewer = LatestImageViewer(args.visualize_window_name)
-    service = RDT2AsyncService(policy, image_viewer=image_viewer)
+    service = RDT2AsyncService(
+        policy,
+        image_viewer=image_viewer,
+        debug_image_dir=args.debug_image_dir,
+        debug_image_limit=args.debug_image_limit,
+        debug_image_every=args.debug_image_every,
+    )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=args.grpc_workers))
     rdt2_async_pb2_grpc.add_RDT2AsyncInferenceServicer_to_server(service, server)
     bind_addr = f"{args.host}:{args.port}"
@@ -332,6 +399,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-compile", action="store_true", help="kept for compatibility; compile is disabled by default")
     parser.add_argument("--visualize-input-images", action="store_true", help="show the latest submitted left/right input images")
     parser.add_argument("--visualize-window-name", default="RDT2 Async Input Images")
+    parser.add_argument("--debug-image-dir", default="")
+    parser.add_argument("--debug-image-limit", default=20, type=int)
+    parser.add_argument("--debug-image-every", default=1, type=int)
     return parser.parse_args()
 
 

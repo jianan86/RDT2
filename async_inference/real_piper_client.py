@@ -15,7 +15,7 @@ import cv2
 import grpc
 import numpy as np
 import yaml
-from async_inference.codec import encode_jpeg, unflatten_action
+from async_inference.codec import encode_jpeg, save_rgb_png, unflatten_action
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
 from async_inference.pose_utils import (
     LEFT_ARM_SLICE,
@@ -127,7 +127,7 @@ class PikaGripper:
         self,
         side: str,
         port: str,
-        fisheye_index: int,
+        fisheye_device: int | str,
         width: int,
         height: int,
         fps: int,
@@ -136,7 +136,7 @@ class PikaGripper:
     ):
         self.side = side
         self.port = port
-        self.fisheye_index = fisheye_index
+        self.fisheye_device = fisheye_device
         self.dry_run = dry_run
         self.device = None
         self.fisheye = None
@@ -151,9 +151,28 @@ class PikaGripper:
             raise RuntimeError(f"failed to connect Pika {side} gripper: {port}")
         self.device.enable()
         self.device.set_camera_param(width, height, fps)
-        self.device.set_fisheye_camera_index(fisheye_index)
+        self.device.set_fisheye_camera_index(fisheye_device)
         self.fisheye = self.device.get_fisheye_camera()
-        print(f"[pika:{side}] connected port={port} fisheye=/dev/video{fisheye_index}")
+        self._wait_for_fisheye_frame(width, height)
+        print(f"[pika:{side}] connected port={port} fisheye={fisheye_device}")
+
+    def _wait_for_fisheye_frame(self, width: int, height: int) -> None:
+        if self.fisheye is None or not getattr(self.fisheye, "is_connected", False):
+            raise RuntimeError(f"failed to connect Pika {self.side} fisheye camera: {self.fisheye_device}")
+
+        deadline = time.time() + 2.0
+        last_shape = None
+        while time.time() < deadline:
+            ok, frame = self.fisheye.get_frame()
+            if ok and frame is not None:
+                last_shape = frame.shape
+                if frame.ndim == 3 and frame.shape[2] == 3:
+                    return
+            time.sleep(0.02)
+        raise RuntimeError(
+            f"failed to read initial Pika {self.side} fisheye frame: "
+            f"device={self.fisheye_device} expected={width}x{height} last_shape={last_shape}"
+        )
 
     def close(self) -> None:
         if self.device is not None:
@@ -188,7 +207,7 @@ class BimanualHardware:
         self.right_gripper = PikaGripper(
             "right",
             args.right_gripper_port,
-            args.right_fisheye_index,
+            args.right_fisheye_device,
             args.camera_width,
             args.camera_height,
             args.camera_fps,
@@ -198,7 +217,7 @@ class BimanualHardware:
         self.left_gripper = PikaGripper(
             "left",
             args.left_gripper_port,
-            args.left_fisheye_index,
+            args.left_fisheye_device,
             args.camera_width,
             args.camera_height,
             args.camera_fps,
@@ -385,6 +404,23 @@ def run(args) -> None:
                 tunnel.kill()
 
 
+def maybe_save_debug_images(args, request_id: int, left: np.ndarray, right: np.ndarray) -> None:
+    if not args.debug_image_dir:
+        return
+    every = max(1, int(args.debug_image_every))
+    if request_id % every != 0:
+        return
+    if args.debug_image_limit > 0 and request_id > args.debug_image_limit * every:
+        return
+
+    base = Path(args.debug_image_dir)
+    try:
+        save_rgb_png(base / f"request_{request_id:06d}_left_client.png", left)
+        save_rgb_png(base / f"request_{request_id:06d}_right_client.png", right)
+    except Exception as exc:
+        print(f"[client] warning: failed to save debug images request_id={request_id}: {exc}")
+
+
 def submit_observations(args, stub, sensors, latest_executed: AtomicInt, stop_event: threading.Event) -> None:
     period = 1.0 / args.request_fps
     request_id = 0
@@ -395,6 +431,7 @@ def submit_observations(args, stub, sensors, latest_executed: AtomicInt, stop_ev
             continue
         request_id += 1
         started = time.time()
+        maybe_save_debug_images(args, request_id, snapshot.left_rgb, snapshot.right_rgb)
         request = rdt2_async_pb2.ObservationRequest(
             request_id=request_id,
             timestamp=snapshot.timestamp,
@@ -556,10 +593,12 @@ def apply_hardware_config(args: argparse.Namespace) -> argparse.Namespace:
     fill("left_piper_can", "left", "piper_can", "left_piper")
     fill("right_gripper_port", "right", "gripper_port", "/dev/ttyUSB0")
     fill("left_gripper_port", "left", "gripper_port", "/dev/ttyUSB1")
+    fill("right_fisheye_device", "right", "fisheye_device", None)
+    fill("left_fisheye_device", "left", "fisheye_device", None)
     fill("right_fisheye_index", "right", "fisheye_index", 0)
     fill("left_fisheye_index", "left", "fisheye_index", 1)
-    args.right_fisheye_index = int(args.right_fisheye_index)
-    args.left_fisheye_index = int(args.left_fisheye_index)
+    args.right_fisheye_device = args.right_fisheye_device or int(args.right_fisheye_index)
+    args.left_fisheye_device = args.left_fisheye_device or int(args.left_fisheye_index)
     return args
 
 def parse_args() -> argparse.Namespace:
@@ -576,6 +615,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-piper-can", default=None)
     parser.add_argument("--right-gripper-port", default=None)
     parser.add_argument("--left-gripper-port", default=None)
+    parser.add_argument("--right-fisheye-device", default=None)
+    parser.add_argument("--left-fisheye-device", default=None)
     parser.add_argument("--right-fisheye-index", default=None, type=int)
     parser.add_argument("--left-fisheye-index", default=None, type=int)
     parser.add_argument("--camera-width", default=640, type=int)
@@ -591,6 +632,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rpc-timeout", default=10.0, type=float)
     parser.add_argument("--connect-timeout", default=10.0, type=float)
     parser.add_argument("--jpeg-quality", default=90, type=int)
+    parser.add_argument("--debug-image-dir", default="")
+    parser.add_argument("--debug-image-limit", default=20, type=int)
+    parser.add_argument("--debug-image-every", default=1, type=int)
     parser.add_argument("--max-pos-step", default=0.01, type=float)
     parser.add_argument("--max-rot-step", default=0.05, type=float)
     parser.add_argument("--max-gripper-step", default=0.005, type=float)

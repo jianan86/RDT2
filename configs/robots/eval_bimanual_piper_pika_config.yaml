@@ -4,10 +4,10 @@ right:
   piper_can: right_piper
   piper_usb_port: "1-1.3:1.0"
   gripper_port: /dev/ttyUSB0
-  fisheye_index: 0
+  fisheye_device: /dev/v4l/by-path/pci-0000:c4:00.3-usb-0:1.1.1:1.0-video-index0
 
 left:
   piper_can: left_piper
   piper_usb_port: "1-1.4:1.0"
   gripper_port: /dev/ttyUSB1
-  fisheye_index: 1
+  fisheye_device: /dev/v4l/by-path/pci-0000:c4:00.3-usb-0:1.2.1:1.0-video-index0

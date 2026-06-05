@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -23,6 +25,16 @@ def decode_jpeg(payload: bytes) -> np.ndarray:
     if bgr is None:
         raise ValueError("failed to decode JPEG")
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def save_rgb_png(path: str | Path, image: np.ndarray) -> None:
+    """Save an HWC uint8 RGB image as PNG."""
+    image = _as_rgb_uint8(image)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    if not cv2.imwrite(str(path), bgr):
+        raise ValueError(f"failed to write image: {path}")
 
 
 def flatten_action(action: np.ndarray) -> tuple[list[float], int, int]:
