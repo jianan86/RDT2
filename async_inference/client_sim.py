@@ -56,7 +56,7 @@ def run(args) -> None:
                 left_stereo_jpeg=encode_jpeg(left),
                 right_stereo_jpeg=encode_jpeg(right),
                 state=np.zeros(args.state_dim, dtype=np.float32).tolist(),
-                eef_pose_flat=np.zeros(14, dtype=np.float32).tolist(),
+                tcp_pose_flat=np.zeros(14, dtype=np.float32).tolist(),
                 latest_executed_timestep=latest_executed_timestep,
             )
             ack = stub.SubmitObservation(request, timeout=args.rpc_timeout)

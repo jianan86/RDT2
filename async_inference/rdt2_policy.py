@@ -5,9 +5,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-import cv2
 import numpy as np
 import yaml
+
+from async_inference.pose_utils import ABS_POSE_DIM, relative_action_to_absolute_tcp, validate_pose14
 
 
 DEFAULT_MODEL_CONFIG = "configs/rdt/post_train.yaml"
@@ -17,7 +18,7 @@ DEFAULT_QWEN_PROCESSOR_PATH = "/data/jianan/rdt2/Qwen2.5-VL-7B-Instruct"
 DEFAULT_NORMALIZER_PATH = "/data/jianan/rdt2/RVQActionTokenizer/umi_normalizer_wo_downsample_indentity_rot.pt"
 DEFAULT_IMAGE_SIZE = 384
 DEFAULT_STATE_DIM = 20
-ABS_EEF_DIM = 14
+ABS_EEF_DIM = ABS_POSE_DIM
 
 
 class DummyRDT2Policy:
@@ -39,11 +40,11 @@ class DummyRDT2Policy:
         right_stereo: np.ndarray,
         state: np.ndarray,
         instruction: str,
-        eef_pose_flat: np.ndarray,
+        tcp_pose_flat: np.ndarray,
     ) -> np.ndarray:
         self._validate_state(state)
-        eef_pose_flat = _validate_eef_pose(eef_pose_flat)
-        return np.repeat(eef_pose_flat[None, :], self.horizon, axis=0).astype(np.float32)
+        tcp_pose_flat = validate_pose14(tcp_pose_flat, "tcp_pose_flat")
+        return np.repeat(tcp_pose_flat[None, :], self.horizon, axis=0).astype(np.float32)
 
     def _validate_state(self, state: np.ndarray) -> None:
         if np.asarray(state).shape != (self.state_dim,):
@@ -63,12 +64,9 @@ class RDT2Policy:
         compile_model: bool = True,
     ):
         import torch
-        from deploy.umi.real_world.real_inference_util import convert_policy_to_tcp_space, get_real_umi_action
         from models.rdt_inferencer import RDTInferencer
 
         self.torch = torch
-        self.convert_policy_to_tcp_space = convert_policy_to_tcp_space
-        self.get_real_umi_action = get_real_umi_action
         self.device = torch.device(device)
         self.config = _load_yaml(model_config)
         self.state_dim = int(self.config["common"]["state_dim"])
@@ -98,8 +96,8 @@ class RDT2Policy:
         left = np.zeros((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE, 3), dtype=np.uint8)
         right = np.zeros((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE, 3), dtype=np.uint8)
         state = np.zeros(self.state_dim, dtype=np.float32)
-        eef_pose_flat = np.zeros(ABS_EEF_DIM, dtype=np.float32)
-        self.step(left, right, state, instruction, eef_pose_flat)
+        tcp_pose_flat = np.zeros(ABS_EEF_DIM, dtype=np.float32)
+        self.step(left, right, state, instruction, tcp_pose_flat)
 
     def step(
         self,
@@ -107,15 +105,13 @@ class RDT2Policy:
         right_stereo: np.ndarray,
         state: np.ndarray,
         instruction: str,
-        eef_pose_flat: np.ndarray,
+        tcp_pose_flat: np.ndarray,
     ) -> np.ndarray:
-        state = np.asarray(state, dtype=np.float32)
-        if state.shape != (self.state_dim,):
-            raise ValueError(f"expected state shape ({self.state_dim},), got {state.shape}")
-        eef_pose_flat = _validate_eef_pose(eef_pose_flat)
+        tcp_pose_flat = validate_pose14(tcp_pose_flat, "tcp_pose_flat")
 
-        left_stereo = _center_crop_resize(left_stereo)
-        right_stereo = _center_crop_resize(right_stereo)
+        left_stereo = _validate_image(left_stereo)
+        right_stereo = _validate_image(right_stereo)
+        state = np.zeros(self.state_dim, dtype=np.float32)
 
         started = time.time()
         with self.torch.no_grad():
@@ -136,8 +132,7 @@ class RDT2Policy:
                 f"expected raw action shape ({self.horizon}, {self.raw_action_dim}), got {raw_action.shape}"
             )
 
-        action = self.convert_policy_to_tcp_space(raw_action)
-        action = self.get_real_umi_action(action, _make_env_obs(eef_pose_flat), action_pose_repr="relative")
+        action = relative_action_to_absolute_tcp(raw_action, tcp_pose_flat)
         action = _postprocess_gripper(action.astype(np.float32, copy=False))
         if action.shape != (self.horizon, self.action_dim):
             raise ValueError(f"expected action shape ({self.horizon}, {self.action_dim}), got {action.shape}")
@@ -145,34 +140,13 @@ class RDT2Policy:
         return action
 
 
-def _center_crop_resize(image: np.ndarray, size: int = DEFAULT_IMAGE_SIZE) -> np.ndarray:
+def _validate_image(image: np.ndarray, size: int = DEFAULT_IMAGE_SIZE) -> np.ndarray:
     image = np.asarray(image)
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"expected HWC RGB image, got shape {image.shape}")
-    h, w = image.shape[:2]
-    side = min(h, w)
-    y0 = (h - side) // 2
-    x0 = (w - side) // 2
-    cropped = image[y0 : y0 + side, x0 : x0 + side]
-    if cropped.shape[0] != size or cropped.shape[1] != size:
-        cropped = cv2.resize(cropped, (size, size), interpolation=cv2.INTER_AREA)
-    return np.ascontiguousarray(cropped.astype(np.uint8, copy=False))
-
-
-def _validate_eef_pose(eef_pose_flat: np.ndarray) -> np.ndarray:
-    eef_pose_flat = np.asarray(eef_pose_flat, dtype=np.float32)
-    if eef_pose_flat.shape != (ABS_EEF_DIM,):
-        raise ValueError(f"expected eef_pose_flat shape ({ABS_EEF_DIM},), got {eef_pose_flat.shape}")
-    return eef_pose_flat
-
-
-def _make_env_obs(eef_pose_flat: np.ndarray) -> dict[str, np.ndarray]:
-    return {
-        "robot0_eef_pos": eef_pose_flat[0:3][None, :],
-        "robot0_eef_rot_axis_angle": eef_pose_flat[3:6][None, :],
-        "robot1_eef_pos": eef_pose_flat[7:10][None, :],
-        "robot1_eef_rot_axis_angle": eef_pose_flat[10:13][None, :],
-    }
+    if image.shape[:2] != (size, size):
+        raise ValueError(f"expected {size}x{size} RGB image, got shape {image.shape}")
+    return np.ascontiguousarray(image.astype(np.uint8, copy=False))
 
 
 def _postprocess_gripper(action: np.ndarray) -> np.ndarray:

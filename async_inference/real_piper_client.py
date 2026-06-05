@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
-import queue
 import signal
 import sys
 import socket
@@ -10,33 +8,33 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import grpc
 import numpy as np
-
+import yaml
 from async_inference.codec import encode_jpeg, unflatten_action
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
+from async_inference.pose_utils import (
+    LEFT_ARM_SLICE,
+    RIGHT_ARM_SLICE,
+    ee_pose14_to_tcp_pose14,
+    slerp_euler_xyz,
+    tcp_pose14_to_ee_pose14,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
 
-LEFT_ARM_SLICE = slice(0, 7)
-RIGHT_ARM_SLICE = slice(7, 14)
-
 
 @dataclass
-class CameraFrames:
+class SensorSnapshot:
     left_rgb: np.ndarray
     right_rgb: np.ndarray
-    timestamp: float
-
-
-@dataclass
-class RobotObservation:
-    eef_pose_flat: np.ndarray
+    tcp_pose_flat: np.ndarray
     timestamp: float
 
 
@@ -54,110 +52,15 @@ class LatestValue:
             return self._value
 
 
-class CameraWorker:
-    def __init__(self, left_device: str, right_device: str, width: int, height: int, fps: int):
-        self.left_device = left_device
-        self.right_device = right_device
+class SensorWorker:
+    def __init__(self, hardware: "BimanualHardware", width: int, height: int, image_size: int):
+        self.hardware = hardware
         self.width = width
         self.height = height
-        self.fps = fps
+        self.image_size = image_size
         self.latest = LatestValue()
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._loop, name="pika-camera", daemon=True)
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        self.thread.join(timeout=2.0)
-
-    def _loop(self) -> None:
-        caps = []
-        try:
-            left_cap = self._open(self.left_device)
-            right_cap = self._open(self.right_device)
-            caps = [left_cap, right_cap]
-            while not self.stop_event.is_set():
-                left = self._read(left_cap)
-                right = self._read(right_cap)
-                self.latest.set(CameraFrames(left_rgb=left, right_rgb=right, timestamp=time.time()))
-                time.sleep(0.001)
-        except Exception as exc:
-            print(f"[camera] stopped: {exc}")
-        finally:
-            for cap in caps:
-                cap.release()
-
-    def _open(self, device: str):
-        cap = cv2.VideoCapture(device)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        cap.set(cv2.CAP_PROP_FPS, self.fps)
-        if not cap.isOpened():
-            raise RuntimeError(f"failed to open camera: {device}")
-        return cap
-
-    def _read(self, cap) -> np.ndarray:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        if frame.shape[1] != self.width or frame.shape[0] != self.height:
-            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-
-class PiperRobot:
-    def __init__(self, can_name: str, dry_run: bool, no_piper: bool):
-        self.dry_run = dry_run
-        self.robot = None
-        if no_piper:
-            return
-        from piper_sdk import C_PiperInterface
-
-        self.robot = C_PiperInterface(can_name=can_name)
-        self.robot.ConnectPort()
-        while not self.robot.EnablePiper():
-            time.sleep(0.01)
-        self.robot.GripperCtrl(0, 1000, 0x01, 0)
-        self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
-
-    def read_eef(self) -> np.ndarray:
-        if self.robot is None:
-            return np.zeros(7, dtype=np.float32)
-        pose = self.robot.GetArmEndPoseMsgs().end_pose
-        gripper = self.robot.GetArmGripperMsgs().gripper_state
-        xyz = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float32) / 1_000_000.0
-        rpy = np.deg2rad(np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float32) / 1000.0)
-        rotvec = euler_xyz_to_rotvec(rpy)
-        grip = np.array([float(gripper.grippers_angle) / 1_000_000.0], dtype=np.float32)
-        return np.concatenate([xyz, rotvec.astype(np.float32), grip])
-
-    def execute(self, target: np.ndarray, effort: int) -> None:
-        if self.robot is None or self.dry_run:
-            return
-        x, y, z, rx, ry, rz, gripper = target.tolist()
-        rpy = rotvec_to_euler_xyz(np.array([rx, ry, rz], dtype=np.float64))
-        self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
-        self.robot.EndPoseCtrl(
-            int(round(x * 1_000_000.0)),
-            int(round(y * 1_000_000.0)),
-            int(round(z * 1_000_000.0)),
-            int(round(math.degrees(rpy[0]) * 1000.0)),
-            int(round(math.degrees(rpy[1]) * 1000.0)),
-            int(round(math.degrees(rpy[2]) * 1000.0)),
-        )
-        self.robot.GripperCtrl(int(round(max(gripper, 0.0) * 1_000_000.0)), effort, 0x01, 0)
-
-
-class ObservationWorker:
-    def __init__(self, robot: PiperRobot, fps: float):
-        self.robot = robot
-        self.period = 1.0 / fps
-        self.latest = LatestValue()
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._loop, name="piper-observation", daemon=True)
+        self.thread = threading.Thread(target=self._loop, name="piper-pika-sensor", daemon=True)
 
     def start(self) -> None:
         self.thread.start()
@@ -168,22 +71,177 @@ class ObservationWorker:
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
-            left = np.zeros(7, dtype=np.float32)
-            right = self.robot.read_eef()
-            self.latest.set(RobotObservation(np.concatenate([left, right]).astype(np.float32), time.time()))
-            time.sleep(self.period)
+            try:
+                left = preprocess_fisheye(self.hardware.left_gripper.read_fisheye_rgb(self.width, self.height), self.image_size)
+                right = preprocess_fisheye(self.hardware.right_gripper.read_fisheye_rgb(self.width, self.height), self.image_size)
+                tcp_pose_flat = self.hardware.read_tcp_pose_flat()
+                self.latest.set(SensorSnapshot(left_rgb=left, right_rgb=right, tcp_pose_flat=tcp_pose_flat, timestamp=time.time()))
+            except Exception as exc:
+                print(f"[sensor] read failed: {exc}")
+            time.sleep(0.001)
+
+
+class PiperRobot:
+    def __init__(self, side: str, can_name: str, dry_run: bool, no_piper: bool):
+        self.side = side
+        self.can_name = can_name
+        self.dry_run = dry_run
+        self.robot = None
+        if no_piper:
+            print(f"[piper:{side}] disabled")
+            return
+        from piper_sdk import C_PiperInterface
+
+        self.robot = C_PiperInterface(can_name=can_name)
+        self.robot.ConnectPort()
+        while not self.robot.EnablePiper():
+            time.sleep(0.01)
+        self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
+        print(f"[piper:{side}] connected can={can_name}")
+
+    def read_pose(self) -> np.ndarray:
+        if self.robot is None:
+            return np.zeros(6, dtype=np.float32)
+        pose = self.robot.GetArmEndPoseMsgs().end_pose
+        xyz = np.array([pose.X_axis, pose.Y_axis, pose.Z_axis], dtype=np.float32) / 1_000_000.0
+        rpy = np.deg2rad(np.array([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float32) / 1000.0)
+        return np.concatenate([xyz, rpy.astype(np.float32)])
+
+    def execute_pose(self, target: np.ndarray) -> None:
+        if self.robot is None or self.dry_run:
+            return
+        x, y, z, roll, pitch, yaw = target[:6].tolist()
+        self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
+        self.robot.EndPoseCtrl(
+            int(round(x * 1_000_000.0)),
+            int(round(y * 1_000_000.0)),
+            int(round(z * 1_000_000.0)),
+            int(round(np.degrees(roll) * 1000.0)),
+            int(round(np.degrees(pitch) * 1000.0)),
+            int(round(np.degrees(yaw) * 1000.0)),
+        )
+
+
+class PikaGripper:
+    def __init__(
+        self,
+        side: str,
+        port: str,
+        fisheye_index: int,
+        width: int,
+        height: int,
+        fps: int,
+        dry_run: bool,
+        no_pika: bool,
+    ):
+        self.side = side
+        self.port = port
+        self.fisheye_index = fisheye_index
+        self.dry_run = dry_run
+        self.device = None
+        self.fisheye = None
+        if no_pika:
+            print(f"[pika:{side}] disabled")
+            return
+
+        from pika.gripper import Gripper
+
+        self.device = Gripper(port)
+        if not self.device.connect():
+            raise RuntimeError(f"failed to connect Pika {side} gripper: {port}")
+        self.device.enable()
+        self.device.set_camera_param(width, height, fps)
+        self.device.set_fisheye_camera_index(fisheye_index)
+        self.fisheye = self.device.get_fisheye_camera()
+        print(f"[pika:{side}] connected port={port} fisheye=/dev/video{fisheye_index}")
+
+    def close(self) -> None:
+        if self.device is not None:
+            self.device.disconnect()
+
+    def read_width(self) -> float:
+        if self.device is None:
+            return 0.0
+        return max(float(self.device.get_gripper_distance()) / 1000.0, 0.0)
+
+    def read_fisheye_rgb(self, width: int, height: int) -> np.ndarray:
+        if self.fisheye is None:
+            return np.zeros((height, width, 3), dtype=np.uint8)
+        ok, frame = self.fisheye.get_frame()
+        if not ok or frame is None:
+            return np.zeros((height, width, 3), dtype=np.uint8)
+        if frame.shape[1] != width or frame.shape[0] != height:
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    def execute_width(self, width_m: float) -> None:
+        if self.device is None or self.dry_run:
+            return
+        width_mm = float(np.clip(width_m * 1000.0, 0.0, 90.0))
+        self.device.set_gripper_distance(width_mm)
+
+
+class BimanualHardware:
+    def __init__(self, args):
+        self.right_arm = PiperRobot("right", args.right_piper_can, args.dry_run, args.no_piper)
+        self.left_arm = PiperRobot("left", args.left_piper_can, args.dry_run, args.no_piper)
+        self.right_gripper = PikaGripper(
+            "right",
+            args.right_gripper_port,
+            args.right_fisheye_index,
+            args.camera_width,
+            args.camera_height,
+            args.camera_fps,
+            args.dry_run,
+            args.no_pika,
+        )
+        self.left_gripper = PikaGripper(
+            "left",
+            args.left_gripper_port,
+            args.left_fisheye_index,
+            args.camera_width,
+            args.camera_height,
+            args.camera_fps,
+            args.dry_run,
+            args.no_pika,
+        )
+
+    def close(self) -> None:
+        self.right_gripper.close()
+        self.left_gripper.close()
+
+    def read_tcp_pose_flat(self) -> np.ndarray:
+        right_ee = np.concatenate([
+            self.right_arm.read_pose(),
+            np.array([self.right_gripper.read_width()], dtype=np.float32),
+        ])
+        left_ee = np.concatenate([
+            self.left_arm.read_pose(),
+            np.array([self.left_gripper.read_width()], dtype=np.float32),
+        ])
+        return ee_pose14_to_tcp_pose14(np.concatenate([right_ee, left_ee]))
+
+    def execute(self, tcp_target: np.ndarray) -> None:
+        ee_target = tcp_pose14_to_ee_pose14(tcp_target)
+        self.right_arm.execute_pose(ee_target[RIGHT_ARM_SLICE])
+        self.left_arm.execute_pose(ee_target[LEFT_ARM_SLICE])
+        self.right_gripper.execute_width(float(tcp_target[RIGHT_ARM_SLICE][6]))
+        self.left_gripper.execute_width(float(tcp_target[LEFT_ARM_SLICE][6]))
 
 
 class ActionQueue:
     def __init__(self):
         self._lock = threading.Lock()
         self._actions: list[tuple[int, np.ndarray]] = []
+        self._last_first_timestep: Optional[int] = None
         self._last_chunk: Optional[np.ndarray] = None
 
     def add_chunk(self, first_timestep: int, action: np.ndarray, latest_executed_timestep: int) -> None:
+        action = np.asarray(action, dtype=np.float32)
         with self._lock:
-            if self._last_chunk is not None:
-                action = self._merge(self._last_chunk, action)
+            if self._last_chunk is not None and self._last_first_timestep is not None:
+                action = self._merge(self._last_first_timestep, self._last_chunk, first_timestep, action)
+            self._last_first_timestep = first_timestep
             self._last_chunk = action.copy()
             self._actions = [
                 (first_timestep + idx, row.copy())
@@ -204,15 +262,21 @@ class ActionQueue:
             return len(self._actions)
 
     @staticmethod
-    def _merge(old: np.ndarray, new: np.ndarray) -> np.ndarray:
+    def _merge(old_first: int, old: np.ndarray, new_first: int, new: np.ndarray) -> np.ndarray:
         merged = new.copy()
-        keep = min(2, len(old), len(new))
-        blend = min(6, len(old) - keep, len(new) - keep)
-        if keep > 0:
-            merged[:keep] = old[:keep]
-        for idx in range(blend):
-            alpha = float(idx + 1) / float(blend + 1)
-            merged[keep + idx] = (1.0 - alpha) * old[keep + idx] + alpha * new[keep + idx]
+        old_last = old_first + len(old) - 1
+        new_last = new_first + len(new) - 1
+        overlap_first = max(old_first, new_first)
+        overlap_last = min(old_last, new_last)
+        if overlap_first > overlap_last:
+            return merged
+
+        overlap = overlap_last - overlap_first + 1
+        for timestep in range(overlap_first, overlap_last + 1):
+            old_idx = timestep - old_first
+            new_idx = timestep - new_first
+            alpha = float(new_idx + 1) / float(overlap + 1)
+            merged[new_idx] = blend_pose14(old[old_idx], new[new_idx], alpha)
         return merged
 
 
@@ -279,16 +343,14 @@ def run(args) -> None:
     else:
         server = args.server
 
-    robot = PiperRobot(args.can, dry_run=args.dry_run, no_piper=args.no_piper)
-    cameras = CameraWorker(args.left_camera, args.right_camera, args.camera_width, args.camera_height, args.camera_fps)
-    observations = ObservationWorker(robot, args.fps)
+    hardware = BimanualHardware(args)
+    sensors = SensorWorker(hardware, args.camera_width, args.camera_height, args.image_size)
     latest_executed = AtomicInt(-1)
     action_queue = ActionQueue()
 
     channel = grpc.insecure_channel(server)
     stub = rdt2_async_pb2_grpc.RDT2AsyncInferenceStub(channel)
-    cameras.start()
-    observations.start()
+    sensors.start()
     stream = None
 
     try:
@@ -302,16 +364,16 @@ def run(args) -> None:
 
         request_thread = threading.Thread(
             target=submit_observations,
-            args=(args, stub, cameras, observations, latest_executed, stop_event),
+            args=(args, stub, sensors, latest_executed, stop_event),
             daemon=True,
         )
         request_thread.start()
-        control_loop(args, robot, action_queue, latest_executed, stop_event)
+        control_loop(args, hardware, action_queue, latest_executed, stop_event)
         request_thread.join(timeout=2.0)
     finally:
         stop_event.set()
-        cameras.stop()
-        observations.stop()
+        sensors.stop()
+        hardware.close()
         if stream is not None:
             stream.join()
         channel.close()
@@ -323,52 +385,70 @@ def run(args) -> None:
                 tunnel.kill()
 
 
-def submit_observations(args, stub, cameras, observations, latest_executed: AtomicInt, stop_event: threading.Event) -> None:
+def submit_observations(args, stub, sensors, latest_executed: AtomicInt, stop_event: threading.Event) -> None:
     period = 1.0 / args.request_fps
     request_id = 0
     while not stop_event.is_set():
-        frames = cameras.latest.get()
-        obs = observations.latest.get()
-        if frames is None or obs is None:
+        snapshot = sensors.latest.get()
+        if snapshot is None:
             time.sleep(0.01)
             continue
         request_id += 1
         started = time.time()
         request = rdt2_async_pb2.ObservationRequest(
             request_id=request_id,
-            timestamp=started,
+            timestamp=snapshot.timestamp,
             instruction=args.instruction,
-            left_stereo_jpeg=encode_jpeg(frames.left_rgb, quality=args.jpeg_quality),
-            right_stereo_jpeg=encode_jpeg(frames.right_rgb, quality=args.jpeg_quality),
+            left_stereo_jpeg=encode_jpeg(snapshot.left_rgb, quality=args.jpeg_quality),
+            right_stereo_jpeg=encode_jpeg(snapshot.right_rgb, quality=args.jpeg_quality),
             state=np.zeros(20, dtype=np.float32).tolist(),
-            eef_pose_flat=obs.eef_pose_flat.tolist(),
+            tcp_pose_flat=snapshot.tcp_pose_flat.tolist(),
             latest_executed_timestep=latest_executed.get(),
         )
         try:
             ack = stub.SubmitObservation(request, timeout=args.rpc_timeout)
             if args.verbose:
                 print(
-                    f"[client] submitted request_id={ack.request_id} latest={request.latest_executed_timestep} "
-                    f"camera_shape={frames.left_rgb.shape}/{frames.right_rgb.shape} eef={obs.eef_pose_flat[7:14].round(4).tolist()}"
+                    f"[client] submitted request_id={ack.request_id} "
+                    f"latest={request.latest_executed_timestep} "
+                    f"camera_shape={snapshot.left_rgb.shape}/{snapshot.right_rgb.shape} "
+                    f"right_tcp={snapshot.tcp_pose_flat[RIGHT_ARM_SLICE].round(4).tolist()} "
+                    f"left_tcp={snapshot.tcp_pose_flat[LEFT_ARM_SLICE].round(4).tolist()}"
                 )
         except grpc.RpcError as exc:
             print(f"[client] submit failed: {exc}")
         sleep_remaining(started, period)
 
 
-def control_loop(args, robot: PiperRobot, action_queue: ActionQueue, latest_executed: AtomicInt, stop_event: threading.Event) -> None:
+def control_loop(
+    args,
+    hardware: BimanualHardware,
+    action_queue: ActionQueue,
+    latest_executed: AtomicInt,
+    stop_event: threading.Event,
+) -> None:
     period = 1.0 / args.fps
-    last_target = robot.read_eef()
+    last_target = hardware.read_tcp_pose_flat()
+    deadline = None if args.run_seconds <= 0 else time.time() + args.run_seconds
     while not stop_event.is_set():
+        if deadline is not None and time.time() >= deadline:
+            stop_event.set()
+            break
         started = time.time()
         item = action_queue.pop_next(latest_executed.get())
         if item is not None:
             timestep, action = item
-            target = limit_step(last_target, action[RIGHT_ARM_SLICE], args)
+            target = last_target.copy()
+            target[RIGHT_ARM_SLICE] = limit_step(last_target[RIGHT_ARM_SLICE], action[RIGHT_ARM_SLICE], args)
+            target[LEFT_ARM_SLICE] = limit_step(last_target[LEFT_ARM_SLICE], action[LEFT_ARM_SLICE], args)
             if args.dry_run:
-                print(f"[dry-run] timestep={timestep} target={target.round(4).tolist()} queue={len(action_queue)}")
+                print(
+                    f"[dry-run] timestep={timestep} "
+                    f"right={target[RIGHT_ARM_SLICE].round(4).tolist()} "
+                    f"left={target[LEFT_ARM_SLICE].round(4).tolist()} queue={len(action_queue)}"
+                )
             else:
-                robot.execute(target, effort=args.gripper_effort)
+                hardware.execute(target)
             last_target = target
             latest_executed.set(timestep)
         sleep_remaining(started, period)
@@ -432,73 +512,55 @@ def sleep_remaining(started: float, period: float) -> None:
         time.sleep(remaining)
 
 
-def rotvec_to_euler_xyz(rotvec: np.ndarray) -> np.ndarray:
-    matrix = rotvec_to_matrix(rotvec)
-    sy = math.sqrt(matrix[0, 0] * matrix[0, 0] + matrix[1, 0] * matrix[1, 0])
-    singular = sy < 1e-6
-    if not singular:
-        x = math.atan2(matrix[2, 1], matrix[2, 2])
-        y = math.atan2(-matrix[2, 0], sy)
-        z = math.atan2(matrix[1, 0], matrix[0, 0])
-    else:
-        x = math.atan2(-matrix[1, 2], matrix[1, 1])
-        y = math.atan2(-matrix[2, 0], sy)
-        z = 0.0
-    return np.array([x, y, z], dtype=np.float64)
+def preprocess_fisheye(image: np.ndarray, size: int) -> np.ndarray:
+    image = np.asarray(image)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"expected HWC RGB image, got shape {image.shape}")
+    h, w = image.shape[:2]
+    side = max(h, w)
+    top = (side - h) // 2
+    bottom = side - h - top
+    left = (side - w) // 2
+    right = side - w - left
+    if top or bottom or left or right:
+        image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    if image.shape[0] != size or image.shape[1] != size:
+        image = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(image.astype(np.uint8, copy=False))
 
 
-def euler_xyz_to_rotvec(rpy: np.ndarray) -> np.ndarray:
-    rx, ry, rz = [float(v) for v in rpy]
-    cx, sx = math.cos(rx), math.sin(rx)
-    cy, sy = math.cos(ry), math.sin(ry)
-    cz, sz = math.cos(rz), math.sin(rz)
-    matrix = np.array(
-        [
-            [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
-            [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
-            [-sy, cy * sx, cy * cx],
-        ],
-        dtype=np.float64,
-    )
-    return matrix_to_rotvec(matrix)
+def blend_pose14(old: np.ndarray, new: np.ndarray, alpha: float) -> np.ndarray:
+    out = (1.0 - alpha) * old + alpha * new
+    for arm_slice in (RIGHT_ARM_SLICE, LEFT_ARM_SLICE):
+        start = arm_slice.start
+        out[start + 3 : start + 6] = slerp_euler_xyz(
+            old[start + 3 : start + 6],
+            new[start + 3 : start + 6],
+            alpha,
+        )
+    return out.astype(np.float32, copy=False)
 
 
-def rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
-    theta = float(np.linalg.norm(rotvec))
-    if theta < 1e-12:
-        return np.eye(3, dtype=np.float64)
-    axis = rotvec / theta
-    x, y, z = axis
-    c = math.cos(theta)
-    s = math.sin(theta)
-    one_c = 1.0 - c
-    return np.array(
-        [
-            [c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s],
-            [y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s],
-            [z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c],
-        ],
-        dtype=np.float64,
-    )
+def apply_hardware_config(args: argparse.Namespace) -> argparse.Namespace:
+    cfg = {}
+    if args.hardware_config:
+        config_path = Path(args.hardware_config).expanduser()
+        with config_path.open("r") as f:
+            cfg = yaml.safe_load(f) or {}
 
+    def fill(name: str, side: str, key: str, default):
+        if getattr(args, name) is None:
+            setattr(args, name, cfg.get(side, {}).get(key, default))
 
-def matrix_to_rotvec(matrix: np.ndarray) -> np.ndarray:
-    cos_theta = float((np.trace(matrix) - 1.0) * 0.5)
-    cos_theta = max(-1.0, min(1.0, cos_theta))
-    theta = math.acos(cos_theta)
-    if theta < 1e-12:
-        return np.zeros(3, dtype=np.float64)
-    denom = 2.0 * math.sin(theta)
-    axis = np.array(
-        [
-            (matrix[2, 1] - matrix[1, 2]) / denom,
-            (matrix[0, 2] - matrix[2, 0]) / denom,
-            (matrix[1, 0] - matrix[0, 1]) / denom,
-        ],
-        dtype=np.float64,
-    )
-    return axis * theta
-
+    fill("right_piper_can", "right", "piper_can", "right_piper")
+    fill("left_piper_can", "left", "piper_can", "left_piper")
+    fill("right_gripper_port", "right", "gripper_port", "/dev/ttyUSB0")
+    fill("left_gripper_port", "left", "gripper_port", "/dev/ttyUSB1")
+    fill("right_fisheye_index", "right", "fisheye_index", 0)
+    fill("left_fisheye_index", "left", "fisheye_index", 1)
+    args.right_fisheye_index = int(args.right_fisheye_index)
+    args.left_fisheye_index = int(args.left_fisheye_index)
+    return args
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RDT2 async Piper real robot client")
@@ -509,17 +571,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-port", default=18080, type=int)
     parser.add_argument("--local-port", default=0, type=int)
     parser.add_argument("--no-tunnel", action="store_true")
-    parser.add_argument("--can", default="can0")
-    parser.add_argument("--left-camera", default="/dev/pika_sensor_fisheye")
-    parser.add_argument("--right-camera", default="/dev/pika_gripper_fisheye")
+    parser.add_argument("--hardware-config", default="configs/robots/eval_bimanual_piper_pika_config.yaml")
+    parser.add_argument("--right-piper-can", default=None)
+    parser.add_argument("--left-piper-can", default=None)
+    parser.add_argument("--right-gripper-port", default=None)
+    parser.add_argument("--left-gripper-port", default=None)
+    parser.add_argument("--right-fisheye-index", default=None, type=int)
+    parser.add_argument("--left-fisheye-index", default=None, type=int)
     parser.add_argument("--camera-width", default=640, type=int)
     parser.add_argument("--camera-height", default=480, type=int)
     parser.add_argument("--camera-fps", default=30, type=int)
+    parser.add_argument("--image-size", default=384, type=int)
     parser.add_argument("--fps", default=30.0, type=float)
     parser.add_argument("--request-fps", default=5.0, type=float)
     parser.add_argument("--instruction", default="move")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--no-piper", action="store_true", help="use zero EEF observations and skip Piper CAN")
+    parser.add_argument("--no-piper", action="store_true", help="use zero arm poses and skip Piper CAN")
+    parser.add_argument("--no-pika", action="store_true", help="use zero gripper widths/images and skip Pika SDK")
     parser.add_argument("--rpc-timeout", default=10.0, type=float)
     parser.add_argument("--connect-timeout", default=10.0, type=float)
     parser.add_argument("--jpeg-quality", default=90, type=int)
@@ -528,9 +596,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gripper-step", default=0.005, type=float)
     parser.add_argument("--min-gripper", default=0.0, type=float)
     parser.add_argument("--max-gripper", default=0.10, type=float)
-    parser.add_argument("--gripper-effort", default=1000, type=int)
+    parser.add_argument("--run-seconds", default=0.0, type=float)
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    return apply_hardware_config(parser.parse_args())
 
 
 if __name__ == "__main__":

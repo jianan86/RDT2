@@ -30,7 +30,7 @@ message ObservationRequest {
   bytes left_stereo_jpeg = 4;
   bytes right_stereo_jpeg = 5;
   repeated float state = 6;
-  repeated float eef_pose_flat = 7;
+  repeated float tcp_pose_flat = 7;
   int64 latest_executed_timestep = 8;
 }
 
