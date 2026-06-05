@@ -404,7 +404,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         for episode_dir in episodes:
             streams = load_episode_streams(episode_dir)
             episode_samples = 0
-            last_start = len(streams.right_camera) - args.horizon + 1
+            last_start = len(streams.right_camera) - args.horizon
             if last_start <= 0:
                 skipped_horizon += len(streams.right_camera)
                 converted_by_episode[episode_dir.name] = 0
@@ -414,9 +414,31 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                 if args.max_samples is not None and sample_id >= args.max_samples:
                     break
 
+                right_camera = streams.right_camera[start_idx]
+                timestamp = right_camera.timestamp
+                right_base = match_side(
+                    timestamp=timestamp,
+                    camera_file=right_camera,
+                    camera_stream=streams.right_camera,
+                    pose_stream=streams.right_pose,
+                    gripper_stream=streams.right_gripper,
+                    max_delta=args.max_sync_delta_sec,
+                )
+                left_base = match_side(
+                    timestamp=timestamp,
+                    camera_file=None,
+                    camera_stream=streams.left_camera,
+                    pose_stream=streams.left_pose,
+                    gripper_stream=streams.left_gripper,
+                    max_delta=args.max_sync_delta_sec,
+                )
+                if right_base is None or left_base is None:
+                    skipped_sync += 1
+                    continue
+
                 right_future: list[MatchedFrame] = []
                 left_future: list[MatchedFrame] = []
-                for offset in range(args.horizon):
+                for offset in range(1, args.horizon + 1):
                     right_camera = streams.right_camera[start_idx + offset]
                     timestamp = right_camera.timestamp
                     right_frame = match_side(
@@ -444,10 +466,10 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                     skipped_sync += 1
                     continue
 
-                image = build_binocular_image(left_future[0].image, right_future[0].image)
+                image = build_binocular_image(left_base.image, right_base.image)
                 action = build_action(
-                    right_base=right_future[0],
-                    left_base=left_future[0],
+                    right_base=right_base,
+                    left_base=left_base,
                     right_future=right_future,
                     left_future=left_future,
                     gripper_input_max=args.gripper_input_max,
