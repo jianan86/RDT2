@@ -55,6 +55,46 @@ def test_preprocess_fisheye_pads_640x480_to_384_square():
     assert out[192, 192].min() == 255
 
 
+def test_action_queue_prefix_no_merge_requires_positive_prefix_steps():
+    try:
+        ActionQueue(
+            chunk_merge_strategy=ActionQueue.PREFIX_NO_MERGE,
+            chunk_execute_prefix_steps=0,
+        )
+    except ValueError as exc:
+        assert "chunk_execute_prefix_steps" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_action_queue_prefix_no_merge_filters_stale_and_takes_first_k():
+    old = np.zeros((4, 14), dtype=np.float32)
+    old[:, 0] = 1.0
+    new = np.zeros((4, 14), dtype=np.float32)
+    new[:, 0] = 3.0
+
+    queue = ActionQueue(
+        chunk_merge_strategy=ActionQueue.PREFIX_NO_MERGE,
+        chunk_execute_prefix_steps=2,
+    )
+    queue.add_chunk(first_timestep=10, action=old, latest_executed_timestep=9)
+    queue.add_chunk(first_timestep=12, action=new, latest_executed_timestep=12)
+
+    first = queue.pop_next(latest_executed_timestep=12)
+    assert first is not None
+    timestep, action = first
+    assert timestep == 13
+    assert action[0] == 3.0
+
+    second = queue.pop_next(latest_executed_timestep=13)
+    assert second is not None
+    timestep, action = second
+    assert timestep == 14
+    assert action[0] == 3.0
+
+    assert queue.pop_next(latest_executed_timestep=14) is None
+
+
 def test_action_queue_drops_expired_and_blends_overlap_by_timestep():
     old = np.zeros((4, 14), dtype=np.float32)
     old[:, 0] = 1.0

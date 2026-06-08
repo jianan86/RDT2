@@ -249,24 +249,36 @@ class BimanualHardware:
 
 
 class ActionQueue:
-    def __init__(self):
+    BLEND_OVERLAP = "blend_overlap"
+    PREFIX_NO_MERGE = "prefix_no_merge"
+
+    def __init__(self, chunk_merge_strategy: str = BLEND_OVERLAP, chunk_execute_prefix_steps: int = 0):
+        if chunk_merge_strategy not in {self.BLEND_OVERLAP, self.PREFIX_NO_MERGE}:
+            raise ValueError(f"unknown chunk_merge_strategy: {chunk_merge_strategy}")
+        if chunk_merge_strategy == self.PREFIX_NO_MERGE and chunk_execute_prefix_steps <= 0:
+            raise ValueError("chunk_execute_prefix_steps must be positive for prefix_no_merge")
         self._lock = threading.Lock()
         self._actions: list[tuple[int, np.ndarray]] = []
         self._last_first_timestep: Optional[int] = None
         self._last_chunk: Optional[np.ndarray] = None
+        self.chunk_merge_strategy = chunk_merge_strategy
+        self.chunk_execute_prefix_steps = int(chunk_execute_prefix_steps)
 
     def add_chunk(self, first_timestep: int, action: np.ndarray, latest_executed_timestep: int) -> None:
         action = np.asarray(action, dtype=np.float32)
         with self._lock:
-            if self._last_chunk is not None and self._last_first_timestep is not None:
+            if (
+                self.chunk_merge_strategy == self.BLEND_OVERLAP
+                and self._last_chunk is not None
+                and self._last_first_timestep is not None
+            ):
                 action = self._merge(self._last_first_timestep, self._last_chunk, first_timestep, action)
             self._last_first_timestep = first_timestep
             self._last_chunk = action.copy()
-            self._actions = [
-                (first_timestep + idx, row.copy())
-                for idx, row in enumerate(action)
-                if first_timestep + idx > latest_executed_timestep
-            ]
+            actions = self._future_actions(first_timestep, action, latest_executed_timestep)
+            if self.chunk_merge_strategy == self.PREFIX_NO_MERGE:
+                actions = actions[: self.chunk_execute_prefix_steps]
+            self._actions = actions
 
     def pop_next(self, latest_executed_timestep: int) -> Optional[tuple[int, np.ndarray]]:
         with self._lock:
@@ -279,6 +291,18 @@ class ActionQueue:
     def __len__(self) -> int:
         with self._lock:
             return len(self._actions)
+
+    @staticmethod
+    def _future_actions(
+        first_timestep: int,
+        action: np.ndarray,
+        latest_executed_timestep: int,
+    ) -> list[tuple[int, np.ndarray]]:
+        return [
+            (first_timestep + idx, row.copy())
+            for idx, row in enumerate(action)
+            if first_timestep + idx > latest_executed_timestep
+        ]
 
     @staticmethod
     def _merge(old_first: int, old: np.ndarray, new_first: int, new: np.ndarray) -> np.ndarray:
@@ -329,7 +353,9 @@ class ActionStreamWorker:
                 self.action_queue.add_chunk(chunk.first_timestep, action, latest)
                 print(
                     f"[client] chunk request_id={chunk.request_id} first={chunk.first_timestep} "
-                    f"shape={list(action.shape)} queue={len(self.action_queue)} latency_ms={chunk.inference_latency_ms:.1f}"
+                    f"shape={list(action.shape)} strategy={self.action_queue.chunk_merge_strategy} "
+                    f"prefix_steps={self.action_queue.chunk_execute_prefix_steps} "
+                    f"queue={len(self.action_queue)} latency_ms={chunk.inference_latency_ms:.1f}"
                 )
         except grpc.RpcError as exc:
             if not self.stop_event.is_set():
@@ -365,7 +391,7 @@ def run(args) -> None:
     hardware = BimanualHardware(args)
     sensors = SensorWorker(hardware, args.camera_width, args.camera_height, args.image_size)
     latest_executed = AtomicInt(-1)
-    action_queue = ActionQueue()
+    action_queue = ActionQueue(args.chunk_merge_strategy, args.chunk_execute_prefix_steps)
 
     channel = grpc.insecure_channel(server)
     stub = rdt2_async_pb2_grpc.RDT2AsyncInferenceStub(channel)
@@ -640,6 +666,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gripper-step", default=0.005, type=float)
     parser.add_argument("--min-gripper", default=0.0, type=float)
     parser.add_argument("--max-gripper", default=0.10, type=float)
+    parser.add_argument(
+        "--chunk-merge-strategy",
+        default=ActionQueue.BLEND_OVERLAP,
+        choices=(ActionQueue.BLEND_OVERLAP, ActionQueue.PREFIX_NO_MERGE),
+        help="How incoming action chunks are merged into the execution queue",
+    )
+    parser.add_argument(
+        "--chunk-execute-prefix-steps",
+        default=0,
+        type=int,
+        help="For prefix_no_merge, execute only the first N future actions from each received chunk",
+    )
     parser.add_argument("--run-seconds", default=0.0, type=float)
     parser.add_argument("--verbose", action="store_true")
     return apply_hardware_config(parser.parse_args())
