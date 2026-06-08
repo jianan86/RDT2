@@ -36,9 +36,12 @@ DEFAULT_INSTRUCTION = (
 )
 DEFAULT_INSTRUCTION_KEY = "0601_dex/bread_to_bowl"
 
-FISHEYE_CAMERA = Path("camera/color/pikaFisheyeCamera_{side}")
-POSE_DIR = Path("localization/pose/pika_{side}")
-GRIPPER_DIR = Path("gripper/encoder/pika_{side}")
+DUAL_FISHEYE_CAMERA = Path("camera/color/pikaFisheyeCamera_{side}")
+DUAL_POSE_DIR = Path("localization/pose/pika_{side}")
+DUAL_GRIPPER_DIR = Path("gripper/encoder/pika_{side}")
+SINGLE_FISHEYE_CAMERA = Path("camera/color/pikaFisheyeCamera")
+SINGLE_POSE_DIR = Path("localization/pose/pika")
+SINGLE_GRIPPER_DIR = Path("gripper/encoder/pika")
 IMAGE_SIZE = 384
 
 
@@ -111,10 +114,11 @@ class ShardWriter:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert Pika UMI data to RDT2-FM WebDataset shards.")
-    parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
+    parser.add_argument("--input-root", type=Path, nargs="+", default=[DEFAULT_INPUT_ROOT])
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--arm-mode", choices=("single", "dual"), default="dual")
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
-    parser.add_argument("--instruction-key", default=DEFAULT_INSTRUCTION_KEY)
+    parser.add_argument("--instruction-key", default=None)
     parser.add_argument("--normalizer-path", type=Path, default=DEFAULT_NORMALIZER_PATH)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--horizon", type=int, default=24)
@@ -171,14 +175,30 @@ def discover_episode_dirs(input_root: Path) -> list[Path]:
     return episodes
 
 
-def load_episode_streams(episode_dir: Path) -> EpisodeStreams:
+def load_episode_streams(episode_dir: Path, arm_mode: str) -> EpisodeStreams:
+    if arm_mode == "single":
+        camera = load_synced_files(episode_dir / SINGLE_FISHEYE_CAMERA)
+        pose = load_synced_files(episode_dir / SINGLE_POSE_DIR)
+        gripper = load_synced_files(episode_dir / SINGLE_GRIPPER_DIR)
+        return EpisodeStreams(
+            right_camera=camera,
+            left_camera=camera,
+            right_pose=pose,
+            left_pose=pose,
+            right_gripper=gripper,
+            left_gripper=gripper,
+        )
+
+    if arm_mode != "dual":
+        raise ValueError(f"Unsupported arm_mode: {arm_mode}")
+
     return EpisodeStreams(
-        right_camera=load_synced_files(episode_dir / Path(str(FISHEYE_CAMERA).format(side="r"))),
-        left_camera=load_synced_files(episode_dir / Path(str(FISHEYE_CAMERA).format(side="l"))),
-        right_pose=load_synced_files(episode_dir / Path(str(POSE_DIR).format(side="r"))),
-        left_pose=load_synced_files(episode_dir / Path(str(POSE_DIR).format(side="l"))),
-        right_gripper=load_synced_files(episode_dir / Path(str(GRIPPER_DIR).format(side="r"))),
-        left_gripper=load_synced_files(episode_dir / Path(str(GRIPPER_DIR).format(side="l"))),
+        right_camera=load_synced_files(episode_dir / Path(str(DUAL_FISHEYE_CAMERA).format(side="r"))),
+        left_camera=load_synced_files(episode_dir / Path(str(DUAL_FISHEYE_CAMERA).format(side="l"))),
+        right_pose=load_synced_files(episode_dir / Path(str(DUAL_POSE_DIR).format(side="r"))),
+        left_pose=load_synced_files(episode_dir / Path(str(DUAL_POSE_DIR).format(side="l"))),
+        right_gripper=load_synced_files(episode_dir / Path(str(DUAL_GRIPPER_DIR).format(side="r"))),
+        left_gripper=load_synced_files(episode_dir / Path(str(DUAL_GRIPPER_DIR).format(side="l"))),
     )
 
 
@@ -381,18 +401,15 @@ def write_dataset_config(output_root: Path, dataset_name: str, normalizer_path: 
 
 
 def convert(args: argparse.Namespace) -> dict[str, Any]:
-    dataset_name = f"rdt2_fm_{args.input_root.name}"
-    instruction_key = args.instruction_key
-    if instruction_key == DEFAULT_INSTRUCTION_KEY:
-        instruction_key = f"{args.input_root.name}/{DEFAULT_INSTRUCTION_KEY.split('/', 1)[1]}"
+    input_roots = args.input_root
+    if isinstance(input_roots, Path):
+        input_roots = [input_roots]
+    dataset_name = args.output_root.name
+    instruction_key = args.instruction_key or f"{args.output_root.name}/{DEFAULT_INSTRUCTION_KEY.split('/', 1)[1]}"
 
     prepare_output_root(args.output_root, args.overwrite)
     write_json(args.output_root / "instructions.json", {instruction_key: args.instruction})
     config_path = write_dataset_config(args.output_root, dataset_name, args.normalizer_path)
-
-    episodes = discover_episode_dirs(args.input_root)
-    if args.max_episodes is not None:
-        episodes = episodes[: args.max_episodes]
 
     sample_id = 0
     skipped_sync = 0
@@ -401,47 +418,28 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
     meta = {"sub_task_instruction_key": instruction_key}
 
     with ShardWriter(args.output_root, args.samples_per_shard) as writer:
-        for episode_dir in episodes:
-            streams = load_episode_streams(episode_dir)
-            episode_samples = 0
-            last_start = len(streams.right_camera) - args.horizon
-            if last_start <= 0:
-                skipped_horizon += len(streams.right_camera)
-                converted_by_episode[episode_dir.name] = 0
-                continue
+        for input_root in input_roots:
+            episodes = discover_episode_dirs(input_root)
+            if args.max_episodes is not None:
+                episodes = episodes[: args.max_episodes]
 
-            for start_idx in range(last_start):
-                if args.max_samples is not None and sample_id >= args.max_samples:
-                    break
-
-                right_camera = streams.right_camera[start_idx]
-                timestamp = right_camera.timestamp
-                right_base = match_side(
-                    timestamp=timestamp,
-                    camera_file=right_camera,
-                    camera_stream=streams.right_camera,
-                    pose_stream=streams.right_pose,
-                    gripper_stream=streams.right_gripper,
-                    max_delta=args.max_sync_delta_sec,
-                )
-                left_base = match_side(
-                    timestamp=timestamp,
-                    camera_file=None,
-                    camera_stream=streams.left_camera,
-                    pose_stream=streams.left_pose,
-                    gripper_stream=streams.left_gripper,
-                    max_delta=args.max_sync_delta_sec,
-                )
-                if right_base is None or left_base is None:
-                    skipped_sync += 1
+            for episode_dir in episodes:
+                streams = load_episode_streams(episode_dir, args.arm_mode)
+                episode_samples = 0
+                episode_key = f"{input_root.name}/{episode_dir.name}"
+                last_start = len(streams.right_camera) - args.horizon
+                if last_start <= 0:
+                    skipped_horizon += len(streams.right_camera)
+                    converted_by_episode[episode_key] = 0
                     continue
 
-                right_future: list[MatchedFrame] = []
-                left_future: list[MatchedFrame] = []
-                for offset in range(1, args.horizon + 1):
-                    right_camera = streams.right_camera[start_idx + offset]
+                for start_idx in range(last_start):
+                    if args.max_samples is not None and sample_id >= args.max_samples:
+                        break
+
+                    right_camera = streams.right_camera[start_idx]
                     timestamp = right_camera.timestamp
-                    right_frame = match_side(
+                    right_base = match_side(
                         timestamp=timestamp,
                         camera_file=right_camera,
                         camera_stream=streams.right_camera,
@@ -449,7 +447,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                         gripper_stream=streams.right_gripper,
                         max_delta=args.max_sync_delta_sec,
                     )
-                    left_frame = match_side(
+                    left_base = match_side(
                         timestamp=timestamp,
                         camera_file=None,
                         camera_stream=streams.left_camera,
@@ -457,40 +455,69 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                         gripper_stream=streams.left_gripper,
                         max_delta=args.max_sync_delta_sec,
                     )
-                    if right_frame is None or left_frame is None:
-                        break
-                    right_future.append(right_frame)
-                    left_future.append(left_frame)
+                    if right_base is None or left_base is None:
+                        skipped_sync += 1
+                        continue
 
-                if len(right_future) != args.horizon or len(left_future) != args.horizon:
-                    skipped_sync += 1
-                    continue
+                    right_future: list[MatchedFrame] = []
+                    left_future: list[MatchedFrame] = []
+                    for offset in range(1, args.horizon + 1):
+                        right_camera = streams.right_camera[start_idx + offset]
+                        timestamp = right_camera.timestamp
+                        right_frame = match_side(
+                            timestamp=timestamp,
+                            camera_file=right_camera,
+                            camera_stream=streams.right_camera,
+                            pose_stream=streams.right_pose,
+                            gripper_stream=streams.right_gripper,
+                            max_delta=args.max_sync_delta_sec,
+                        )
+                        left_frame = match_side(
+                            timestamp=timestamp,
+                            camera_file=None,
+                            camera_stream=streams.left_camera,
+                            pose_stream=streams.left_pose,
+                            gripper_stream=streams.left_gripper,
+                            max_delta=args.max_sync_delta_sec,
+                        )
+                        if right_frame is None or left_frame is None:
+                            break
+                        right_future.append(right_frame)
+                        left_future.append(left_frame)
 
-                image = build_binocular_image(left_base.image, right_base.image)
-                action = build_action(
-                    right_base=right_base,
-                    left_base=left_base,
-                    right_future=right_future,
-                    left_future=left_future,
-                    gripper_input_max=args.gripper_input_max,
-                    gripper_output_max=args.gripper_output_max,
-                )
-                writer.write_sample(sample_id, image=image, action=action, meta=meta)
-                sample_id += 1
-                episode_samples += 1
+                    if len(right_future) != args.horizon or len(left_future) != args.horizon:
+                        skipped_sync += 1
+                        continue
 
-            converted_by_episode[episode_dir.name] = episode_samples
-            logging.info("Converted %s samples from %s", episode_samples, episode_dir)
+                    image = build_binocular_image(left_base.image, right_base.image)
+                    action = build_action(
+                        right_base=right_base,
+                        left_base=left_base,
+                        right_future=right_future,
+                        left_future=left_future,
+                        gripper_input_max=args.gripper_input_max,
+                        gripper_output_max=args.gripper_output_max,
+                    )
+                    writer.write_sample(sample_id, image=image, action=action, meta=meta)
+                    sample_id += 1
+                    episode_samples += 1
+
+                converted_by_episode[episode_key] = episode_samples
+                logging.info("Converted %s samples from %s", episode_samples, episode_dir)
+                if args.max_samples is not None and sample_id >= args.max_samples:
+                    break
+
             if args.max_samples is not None and sample_id >= args.max_samples:
                 break
 
     manifest = {
-        "input_root": str(args.input_root),
+        "input_roots": [str(input_root) for input_root in input_roots],
         "output_root": str(args.output_root),
         "dataset_config": str(config_path),
         "dataset_name": dataset_name,
         "instruction_key": instruction_key,
         "instruction": args.instruction,
+        "arm_mode": args.arm_mode,
         "fps": args.fps,
         "horizon": args.horizon,
         "max_sync_delta_sec": args.max_sync_delta_sec,

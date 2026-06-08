@@ -20,6 +20,7 @@ from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
 from async_inference.pose_utils import (
     LEFT_ARM_SLICE,
     RIGHT_ARM_SLICE,
+    SINGLE_ARM_DIM,
     ee_pose14_to_tcp_pose14,
     slerp_euler_xyz,
     tcp_pose14_to_ee_pose14,
@@ -72,8 +73,14 @@ class SensorWorker:
     def _loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                left = preprocess_fisheye(self.hardware.left_gripper.read_fisheye_rgb(self.width, self.height), self.image_size)
                 right = preprocess_fisheye(self.hardware.right_gripper.read_fisheye_rgb(self.width, self.height), self.image_size)
+                if self.hardware.arm_mode == "single":
+                    left = right.copy()
+                else:
+                    left = preprocess_fisheye(
+                        self.hardware.left_gripper.read_fisheye_rgb(self.width, self.height),
+                        self.image_size,
+                    )
                 tcp_pose_flat = self.hardware.read_tcp_pose_flat()
                 self.latest.set(SensorSnapshot(left_rgb=left, right_rgb=right, tcp_pose_flat=tcp_pose_flat, timestamp=time.time()))
             except Exception as exc:
@@ -202,8 +209,8 @@ class PikaGripper:
 
 class BimanualHardware:
     def __init__(self, args):
+        self.arm_mode = args.arm_mode
         self.right_arm = PiperRobot("right", args.right_piper_can, args.dry_run, args.no_piper)
-        self.left_arm = PiperRobot("left", args.left_piper_can, args.dry_run, args.no_piper)
         self.right_gripper = PikaGripper(
             "right",
             args.right_gripper_port,
@@ -214,26 +221,36 @@ class BimanualHardware:
             args.dry_run,
             args.no_pika,
         )
-        self.left_gripper = PikaGripper(
-            "left",
-            args.left_gripper_port,
-            args.left_fisheye_device,
-            args.camera_width,
-            args.camera_height,
-            args.camera_fps,
-            args.dry_run,
-            args.no_pika,
-        )
+        self.left_arm = None
+        self.left_gripper = None
+        if self.arm_mode == "dual":
+            self.left_arm = PiperRobot("left", args.left_piper_can, args.dry_run, args.no_piper)
+            self.left_gripper = PikaGripper(
+                "left",
+                args.left_gripper_port,
+                args.left_fisheye_device,
+                args.camera_width,
+                args.camera_height,
+                args.camera_fps,
+                args.dry_run,
+                args.no_pika,
+            )
 
     def close(self) -> None:
         self.right_gripper.close()
-        self.left_gripper.close()
+        if self.left_gripper is not None:
+            self.left_gripper.close()
 
     def read_tcp_pose_flat(self) -> np.ndarray:
         right_ee = np.concatenate([
             self.right_arm.read_pose(),
             np.array([self.right_gripper.read_width()], dtype=np.float32),
         ])
+        if self.arm_mode == "single":
+            right_tcp = ee_pose14_to_tcp_pose14(np.concatenate([right_ee, right_ee]))[RIGHT_ARM_SLICE]
+            return duplicate_single_arm_pose14(right_tcp)
+
+        assert self.left_arm is not None and self.left_gripper is not None
         left_ee = np.concatenate([
             self.left_arm.read_pose(),
             np.array([self.left_gripper.read_width()], dtype=np.float32),
@@ -241,6 +258,13 @@ class BimanualHardware:
         return ee_pose14_to_tcp_pose14(np.concatenate([right_ee, left_ee]))
 
     def execute(self, tcp_target: np.ndarray) -> None:
+        if self.arm_mode == "single":
+            ee_target = tcp_pose14_to_ee_pose14(duplicate_single_arm_pose14(tcp_target[RIGHT_ARM_SLICE]))
+            self.right_arm.execute_pose(ee_target[RIGHT_ARM_SLICE])
+            self.right_gripper.execute_width(float(tcp_target[RIGHT_ARM_SLICE][6]))
+            return
+
+        assert self.left_arm is not None and self.left_gripper is not None
         ee_target = tcp_pose14_to_ee_pose14(tcp_target)
         self.right_arm.execute_pose(ee_target[RIGHT_ARM_SLICE])
         self.left_arm.execute_pose(ee_target[LEFT_ARM_SLICE])
@@ -324,11 +348,12 @@ class ActionQueue:
 
 
 class ActionStreamWorker:
-    def __init__(self, stub, action_queue: ActionQueue, latest_executed, stop_event: threading.Event):
+    def __init__(self, stub, action_queue: ActionQueue, latest_executed, stop_event: threading.Event, arm_mode: str):
         self.stub = stub
         self.action_queue = action_queue
         self.latest_executed = latest_executed
         self.stop_event = stop_event
+        self.arm_mode = arm_mode
         self.thread = threading.Thread(target=self._loop, name="action-stream", daemon=True)
 
     def start(self) -> None:
@@ -349,6 +374,7 @@ class ActionStreamWorker:
                 if action.shape[1] != 14:
                     print(f"[client] ignoring action with shape={list(action.shape)}")
                     continue
+                action = adapt_action_for_arm_mode(action, self.arm_mode)
                 latest = self.latest_executed.get()
                 self.action_queue.add_chunk(chunk.first_timestep, action, latest)
                 print(
@@ -404,7 +430,7 @@ def run(args) -> None:
         print(f"[client] health ready={health.ready} message={health.message}", flush=True)
         reset = stub.Reset(rdt2_async_pb2.ResetRequest(), timeout=args.rpc_timeout)
         print(f"[client] reset ok={reset.ok} message={reset.message}", flush=True)
-        stream = ActionStreamWorker(stub, action_queue, latest_executed, stop_event)
+        stream = ActionStreamWorker(stub, action_queue, latest_executed, stop_event, args.arm_mode)
         stream.start()
 
         request_thread = threading.Thread(
@@ -592,6 +618,23 @@ def preprocess_fisheye(image: np.ndarray, size: int) -> np.ndarray:
     return np.ascontiguousarray(image.astype(np.uint8, copy=False))
 
 
+def duplicate_single_arm_pose14(pose7: np.ndarray) -> np.ndarray:
+    pose7 = np.asarray(pose7, dtype=np.float32)
+    if pose7.shape != (SINGLE_ARM_DIM,):
+        raise ValueError(f"expected single arm pose shape ({SINGLE_ARM_DIM},), got {pose7.shape}")
+    return np.concatenate([pose7, pose7]).astype(np.float32, copy=False)
+
+
+def adapt_action_for_arm_mode(action: np.ndarray, arm_mode: str) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float32)
+    if arm_mode == "dual":
+        return action
+    if arm_mode == "single":
+        right_action = action[:, RIGHT_ARM_SLICE]
+        return np.concatenate([right_action, right_action], axis=1).astype(np.float32, copy=False)
+    raise ValueError(f"unsupported arm_mode: {arm_mode}")
+
+
 def blend_pose14(old: np.ndarray, new: np.ndarray, alpha: float) -> np.ndarray:
     out = (1.0 - alpha) * old + alpha * new
     for arm_slice in (RIGHT_ARM_SLICE, LEFT_ARM_SLICE):
@@ -637,6 +680,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-port", default=0, type=int)
     parser.add_argument("--no-tunnel", action="store_true")
     parser.add_argument("--hardware-config", default="configs/robots/eval_bimanual_piper_pika_config.yaml")
+    parser.add_argument("--arm-mode", choices=("dual", "single"), default="dual")
     parser.add_argument("--right-piper-can", default=None)
     parser.add_argument("--left-piper-can", default=None)
     parser.add_argument("--right-gripper-port", default=None)

@@ -13,7 +13,12 @@ from async_inference.pose_utils import (
     relative_action_to_absolute_tcp,
     tcp_pose14_to_ee_pose14,
 )
-from async_inference.real_piper_client import ActionQueue, preprocess_fisheye
+from async_inference.real_piper_client import (
+    ActionQueue,
+    adapt_action_for_arm_mode,
+    duplicate_single_arm_pose14,
+    preprocess_fisheye,
+)
 
 
 def test_ee_tcp_roundtrip_pose14():
@@ -53,6 +58,34 @@ def test_preprocess_fisheye_pads_640x480_to_384_square():
     assert out[0].max() == 0
     assert out[-1].max() == 0
     assert out[192, 192].min() == 255
+
+
+def test_duplicate_single_arm_pose14_copies_right_pose_to_both_slots():
+    pose7 = np.arange(7, dtype=np.float32)
+
+    pose14 = duplicate_single_arm_pose14(pose7)
+
+    assert pose14.shape == (14,)
+    np.testing.assert_allclose(pose14[:7], pose7)
+    np.testing.assert_allclose(pose14[7:], pose7)
+
+
+def test_adapt_action_for_single_arm_copies_right_action_to_left_slot():
+    action = np.arange(28, dtype=np.float32).reshape(2, 14)
+
+    adapted = adapt_action_for_arm_mode(action, "single")
+
+    assert adapted.shape == (2, 14)
+    np.testing.assert_allclose(adapted[:, :7], action[:, :7])
+    np.testing.assert_allclose(adapted[:, 7:], action[:, :7])
+
+
+def test_adapt_action_for_dual_arm_leaves_action_unchanged():
+    action = np.arange(28, dtype=np.float32).reshape(2, 14)
+
+    adapted = adapt_action_for_arm_mode(action, "dual")
+
+    assert adapted is action
 
 
 def test_action_queue_prefix_no_merge_requires_positive_prefix_steps():
