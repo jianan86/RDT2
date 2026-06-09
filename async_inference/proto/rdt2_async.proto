@@ -31,7 +31,10 @@ message ObservationRequest {
   bytes right_stereo_jpeg = 5;
   repeated float state = 6;
   repeated float tcp_pose_flat = 7;
-  int64 latest_executed_timestep = 8;
+  int64 latest_action = 8;
+  int32 action_queue_size = 9;
+  double queue_ratio = 10;
+  bool must_go = 11;
 }
 
 message ObservationAck {
@@ -50,5 +53,5 @@ message ActionChunk {
   int32 action_dim = 5;
   double inference_latency_ms = 6;
   string error = 7;
-  int64 first_timestep = 8;
+  int64 latest_action = 8;
 }

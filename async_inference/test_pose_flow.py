@@ -13,12 +13,14 @@ from async_inference.pose_utils import (
     relative_action_to_absolute_tcp,
     tcp_pose14_to_ee_pose14,
 )
+from async_inference.proto import rdt2_async_pb2
 from async_inference.real_piper_client import (
     ActionQueue,
     adapt_action_for_arm_mode,
     duplicate_single_arm_pose14,
     preprocess_fisheye,
 )
+from async_inference.server import RDT2AsyncService
 
 
 def test_ee_tcp_roundtrip_pose14():
@@ -110,22 +112,48 @@ def test_action_queue_prefix_no_merge_filters_stale_and_takes_first_k():
         chunk_merge_strategy=ActionQueue.PREFIX_NO_MERGE,
         chunk_execute_prefix_steps=2,
     )
-    queue.add_chunk(first_timestep=10, action=old, latest_executed_timestep=9)
-    queue.add_chunk(first_timestep=12, action=new, latest_executed_timestep=12)
+    queue.add_chunk(chunk_latest_action=9, action=old, current_latest_action=9)
+    queue.add_chunk(chunk_latest_action=12, action=new, current_latest_action=12)
 
-    first = queue.pop_next(latest_executed_timestep=12)
+    first = queue.pop_next(latest_action=12)
     assert first is not None
     timestep, action = first
     assert timestep == 13
     assert action[0] == 3.0
 
-    second = queue.pop_next(latest_executed_timestep=13)
+    second = queue.pop_next(latest_action=13)
     assert second is not None
     timestep, action = second
     assert timestep == 14
     assert action[0] == 3.0
 
-    assert queue.pop_next(latest_executed_timestep=14) is None
+    assert queue.pop_next(latest_action=14) is None
+
+
+def test_action_queue_default_prefix_no_merge_takes_first_8_future_steps():
+    action = np.zeros((12, 14), dtype=np.float32)
+    action[:, 0] = np.arange(12, dtype=np.float32)
+
+    queue = ActionQueue()
+    queue.add_chunk(chunk_latest_action=9, action=action, current_latest_action=9)
+
+    popped = [queue.pop_next(latest_action=9 + i) for i in range(8)]
+
+    assert len(queue) == 0
+    assert [item[0] for item in popped if item is not None] == list(range(10, 18))
+
+
+def test_action_queue_derives_steps_from_latest_action():
+    action = np.zeros((4, 14), dtype=np.float32)
+    action[:, 0] = np.arange(4, dtype=np.float32)
+
+    queue = ActionQueue(chunk_merge_strategy=ActionQueue.LATEST_ONLY)
+    queue.add_chunk(chunk_latest_action=-1, action=action, current_latest_action=-1)
+
+    first = queue.pop_next(latest_action=-1)
+    assert first is not None
+    assert first[0] == 0
+    assert first[1][0] == 0.0
 
 
 def test_action_queue_drops_expired_and_blends_overlap_by_timestep():
@@ -134,16 +162,52 @@ def test_action_queue_drops_expired_and_blends_overlap_by_timestep():
     new = np.zeros((4, 14), dtype=np.float32)
     new[:, 0] = 3.0
 
-    queue = ActionQueue()
-    queue.add_chunk(first_timestep=10, action=old, latest_executed_timestep=9)
-    queue.add_chunk(first_timestep=12, action=new, latest_executed_timestep=11)
+    queue = ActionQueue(chunk_merge_strategy=ActionQueue.BLEND_OVERLAP)
+    queue.add_chunk(chunk_latest_action=9, action=old, current_latest_action=9)
+    queue.add_chunk(chunk_latest_action=11, action=new, current_latest_action=11)
 
-    first = queue.pop_next(latest_executed_timestep=11)
+    first = queue.pop_next(latest_action=11)
     assert first is not None
     timestep, action = first
     assert timestep == 12
     assert 1.0 < action[0] < 3.0
 
-    second = queue.pop_next(latest_executed_timestep=12)
+    second = queue.pop_next(latest_action=12)
     assert second is not None
     assert second[0] == 13
+
+
+def test_server_filters_duplicate_latest_action_unless_must_go():
+    service = RDT2AsyncService(policy=None)
+    try:
+        with service.predicted_latest_actions_lock:
+            service.predicted_latest_actions.add(7)
+
+        duplicate = rdt2_async_pb2.ObservationRequest(
+            request_id=1,
+            timestamp=0.0,
+            latest_action=7,
+            must_go=False,
+        )
+        ack = service.SubmitObservation(duplicate, None)
+        assert not ack.accepted
+
+        must_go = rdt2_async_pb2.ObservationRequest(
+            request_id=2,
+            timestamp=0.0,
+            latest_action=7,
+            must_go=True,
+        )
+        ack = service.SubmitObservation(must_go, None)
+        assert ack.accepted
+    finally:
+        service.shutdown()
+
+
+def test_action_chunk_carries_latest_action_only():
+    chunk = rdt2_async_pb2.ActionChunk(
+        request_id=3,
+        latest_action=11,
+    )
+
+    assert chunk.latest_action == 11

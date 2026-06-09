@@ -35,7 +35,10 @@ class QueuedObservation:
     right_stereo_jpeg: bytes
     state: list[float]
     tcp_pose_flat: list[float]
-    latest_executed_timestep: int
+    latest_action: int
+    action_queue_size: int
+    queue_ratio: float
+    must_go: bool
 
 
 class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
@@ -51,6 +54,8 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
         self.saved_first_input_images = False
         self.observation_queue: queue.Queue[QueuedObservation] = queue.Queue(maxsize=1)
         self.action_queue: queue.Queue[rdt2_async_pb2.ActionChunk] = queue.Queue()
+        self.predicted_latest_actions: set[int] = set()
+        self.predicted_latest_actions_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.worker = threading.Thread(target=self._worker_loop, name="rdt2-inference-worker", daemon=True)
         self.worker.start()
@@ -63,6 +68,8 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
     def Reset(self, request, context):
         self._drain(self.observation_queue)
         self._drain(self.action_queue)
+        with self.predicted_latest_actions_lock:
+            self.predicted_latest_actions.clear()
         try:
             self.policy.reset()
         except Exception as exc:
@@ -70,6 +77,20 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
         return rdt2_async_pb2.ResetResponse(ok=True, message="reset")
 
     def SubmitObservation(self, request, context):
+        latest_action = request.latest_action
+        with self.predicted_latest_actions_lock:
+            already_predicted = latest_action in self.predicted_latest_actions
+        if already_predicted and not request.must_go:
+            print(
+                f"[server] filtered observation request_id={request.request_id} "
+                f"latest_action={latest_action} already predicted"
+            )
+            return rdt2_async_pb2.ObservationAck(
+                request_id=request.request_id,
+                accepted=False,
+                message="latest_action already predicted",
+            )
+
         item = QueuedObservation(
             request_id=request.request_id,
             timestamp=request.timestamp,
@@ -78,13 +99,16 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
             right_stereo_jpeg=request.right_stereo_jpeg,
             state=list(request.state),
             tcp_pose_flat=list(request.tcp_pose_flat),
-            latest_executed_timestep=request.latest_executed_timestep,
+            latest_action=latest_action,
+            action_queue_size=request.action_queue_size,
+            queue_ratio=request.queue_ratio,
+            must_go=request.must_go,
         )
         self._save_input_images(item)
         self._put_latest(self.observation_queue, item)
         print(
             f"[server] accepted observation request_id={item.request_id} "
-            f"latest_executed_timestep={item.latest_executed_timestep}"
+            f"latest_action={item.latest_action} queue_ratio={item.queue_ratio:.3f} must_go={item.must_go}"
         )
         return rdt2_async_pb2.ObservationAck(
             request_id=request.request_id,
@@ -135,10 +159,11 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
                 right = decode_jpeg(item.right_stereo_jpeg)
                 state = np.asarray(item.state or [0.0] * DEFAULT_STATE_DIM, dtype=np.float32)
                 tcp_pose_flat = np.asarray(item.tcp_pose_flat, dtype=np.float32)
+                with self.predicted_latest_actions_lock:
+                    self.predicted_latest_actions.add(item.latest_action)
                 action = self.policy.step(left, right, state, item.instruction, tcp_pose_flat)
                 action_flat, horizon, action_dim = flatten_action(action)
                 latency_ms = (time.time() - started) * 1000.0
-                first_timestep = item.latest_executed_timestep + 1
                 chunk = rdt2_async_pb2.ActionChunk(
                     request_id=item.request_id,
                     created_timestamp=time.time(),
@@ -146,11 +171,14 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
                     horizon=horizon,
                     action_dim=action_dim,
                     inference_latency_ms=latency_ms,
-                    first_timestep=first_timestep,
+                    latest_action=item.latest_action,
                 )
+                first_action = max(item.latest_action, 0)
+                last_action = first_action + horizon - 1
                 print(
                     f"[server] completed request_id={item.request_id} "
-                    f"first_timestep={first_timestep} shape=[{horizon}, {action_dim}] latency_ms={latency_ms:.1f}"
+                    f"latest_action={item.latest_action} action_steps={first_action}:{last_action} "
+                    f"shape=[{horizon}, {action_dim}] latency_ms={latency_ms:.1f}"
                 )
             except Exception as exc:
                 chunk = rdt2_async_pb2.ActionChunk(
@@ -158,7 +186,7 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
                     created_timestamp=time.time(),
                     inference_latency_ms=(time.time() - started) * 1000.0,
                     error=str(exc),
-                    first_timestep=item.latest_executed_timestep + 1,
+                    latest_action=item.latest_action,
                 )
                 print(f"[server] request_id={item.request_id} failed: {exc}")
 

@@ -273,44 +273,60 @@ class BimanualHardware:
 
 
 class ActionQueue:
-    BLEND_OVERLAP = "blend_overlap"
     PREFIX_NO_MERGE = "prefix_no_merge"
+    BLEND_OVERLAP = "blend_overlap"
+    RTC_SMOOTH = "rtc_smooth"
+    LATEST_ONLY = "latest_only"
+    DEFAULT_PREFIX_STEPS = 8
 
-    def __init__(self, chunk_merge_strategy: str = BLEND_OVERLAP, chunk_execute_prefix_steps: int = 0):
-        if chunk_merge_strategy not in {self.BLEND_OVERLAP, self.PREFIX_NO_MERGE}:
+    def __init__(
+        self,
+        chunk_merge_strategy: str = PREFIX_NO_MERGE,
+        chunk_execute_prefix_steps: int = DEFAULT_PREFIX_STEPS,
+    ):
+        valid = {self.PREFIX_NO_MERGE, self.BLEND_OVERLAP, self.RTC_SMOOTH, self.LATEST_ONLY}
+        if chunk_merge_strategy not in valid:
             raise ValueError(f"unknown chunk_merge_strategy: {chunk_merge_strategy}")
         if chunk_merge_strategy == self.PREFIX_NO_MERGE and chunk_execute_prefix_steps <= 0:
             raise ValueError("chunk_execute_prefix_steps must be positive for prefix_no_merge")
         self._lock = threading.Lock()
         self._actions: list[tuple[int, np.ndarray]] = []
-        self._last_first_timestep: Optional[int] = None
-        self._last_chunk: Optional[np.ndarray] = None
         self.chunk_merge_strategy = chunk_merge_strategy
         self.chunk_execute_prefix_steps = int(chunk_execute_prefix_steps)
+        self.action_chunk_size = 0
 
-    def add_chunk(self, first_timestep: int, action: np.ndarray, latest_executed_timestep: int) -> None:
+    def add_chunk(
+        self,
+        chunk_latest_action: int,
+        action: np.ndarray,
+        current_latest_action: Optional[int] = None,
+    ) -> None:
         action = np.asarray(action, dtype=np.float32)
-        with self._lock:
-            if (
-                self.chunk_merge_strategy == self.BLEND_OVERLAP
-                and self._last_chunk is not None
-                and self._last_first_timestep is not None
-            ):
-                action = self._merge(self._last_first_timestep, self._last_chunk, first_timestep, action)
-            self._last_first_timestep = first_timestep
-            self._last_chunk = action.copy()
-            actions = self._future_actions(first_timestep, action, latest_executed_timestep)
-            if self.chunk_merge_strategy == self.PREFIX_NO_MERGE:
-                actions = actions[: self.chunk_execute_prefix_steps]
-            self._actions = actions
+        if current_latest_action is None:
+            current_latest_action = chunk_latest_action
+        base_timestep = max(int(chunk_latest_action), 0)
+        incoming = self._future_actions(base_timestep, action, int(current_latest_action))
 
-    def pop_next(self, latest_executed_timestep: int) -> Optional[tuple[int, np.ndarray]]:
         with self._lock:
-            while self._actions and self._actions[0][0] <= latest_executed_timestep:
+            self.action_chunk_size = max(self.action_chunk_size, int(action.shape[0]))
+            if self.chunk_merge_strategy == self.PREFIX_NO_MERGE:
+                self._actions = incoming[: self.chunk_execute_prefix_steps]
+            elif self.chunk_merge_strategy == self.LATEST_ONLY:
+                self._actions = incoming
+            else:
+                self._actions = self._merge_with_existing(incoming, int(current_latest_action))
+
+    def pop_next(self, latest_action: int) -> Optional[tuple[int, np.ndarray]]:
+        with self._lock:
+            while self._actions and self._actions[0][0] <= latest_action:
                 self._actions.pop(0)
             if not self._actions:
                 return None
             return self._actions.pop(0)
+
+    def queue_ratio(self) -> float:
+        with self._lock:
+            return len(self._actions) / max(1, self.action_chunk_size)
 
     def __len__(self) -> int:
         with self._lock:
@@ -318,40 +334,67 @@ class ActionQueue:
 
     @staticmethod
     def _future_actions(
-        first_timestep: int,
+        base_timestep: int,
         action: np.ndarray,
-        latest_executed_timestep: int,
+        latest_action: int,
     ) -> list[tuple[int, np.ndarray]]:
         return [
-            (first_timestep + idx, row.copy())
+            (base_timestep + idx, row.copy())
             for idx, row in enumerate(action)
-            if first_timestep + idx > latest_executed_timestep
+            if base_timestep + idx > latest_action
         ]
 
-    @staticmethod
-    def _merge(old_first: int, old: np.ndarray, new_first: int, new: np.ndarray) -> np.ndarray:
-        merged = new.copy()
-        old_last = old_first + len(old) - 1
-        new_last = new_first + len(new) - 1
-        overlap_first = max(old_first, new_first)
-        overlap_last = min(old_last, new_last)
-        if overlap_first > overlap_last:
-            return merged
+    def _merge_with_existing(
+        self,
+        incoming: list[tuple[int, np.ndarray]],
+        latest_action: int,
+    ) -> list[tuple[int, np.ndarray]]:
+        old_live = [(ts, act) for ts, act in self._actions if ts > latest_action]
+        if not incoming:
+            return old_live
+        if not old_live:
+            return incoming
 
-        overlap = overlap_last - overlap_first + 1
-        for timestep in range(overlap_first, overlap_last + 1):
-            old_idx = timestep - old_first
-            new_idx = timestep - new_first
-            alpha = float(new_idx + 1) / float(overlap + 1)
-            merged[new_idx] = blend_pose14(old[old_idx], new[new_idx], alpha)
-        return merged
+        old_by_timestep = {ts: act for ts, act in old_live}
+        incoming_by_timestep = {ts: act for ts, act in incoming}
+        incoming_first = incoming[0][0]
+        overlap_timesteps = [ts for ts, _ in incoming if ts in old_by_timestep]
+        overlap_count = max(1, len(overlap_timesteps))
+        overlap_index = 0
+        output: dict[int, np.ndarray] = {}
+
+        for ts, act in old_live:
+            if ts < incoming_first and ts not in incoming_by_timestep:
+                output[ts] = act
+
+        for ts, act in incoming:
+            old = old_by_timestep.get(ts)
+            if old is None:
+                output[ts] = act
+                continue
+            alpha = float(overlap_index + 1) / float(overlap_count + 1)
+            output[ts] = blend_pose14(old, act, alpha)
+            overlap_index += 1
+
+        return [(ts, output[ts]) for ts in sorted(output)]
 
 
 class ActionStreamWorker:
-    def __init__(self, stub, action_queue: ActionQueue, latest_executed, stop_event: threading.Event, arm_mode: str):
+    def __init__(
+        self,
+        stub,
+        action_queue: ActionQueue,
+        latest_action,
+        request_in_flight,
+        must_go,
+        stop_event: threading.Event,
+        arm_mode: str,
+    ):
         self.stub = stub
         self.action_queue = action_queue
-        self.latest_executed = latest_executed
+        self.latest_action = latest_action
+        self.request_in_flight = request_in_flight
+        self.must_go = must_go
         self.stop_event = stop_event
         self.arm_mode = arm_mode
         self.thread = threading.Thread(target=self._loop, name="action-stream", daemon=True)
@@ -368,6 +411,8 @@ class ActionStreamWorker:
                 if self.stop_event.is_set():
                     return
                 if chunk.error:
+                    self.request_in_flight.set(-1)
+                    self.must_go.set(True)
                     print(f"[client] action request_id={chunk.request_id} error={chunk.error}")
                     continue
                 action = unflatten_action(list(chunk.action_flat), chunk.horizon, chunk.action_dim)
@@ -375,10 +420,15 @@ class ActionStreamWorker:
                     print(f"[client] ignoring action with shape={list(action.shape)}")
                     continue
                 action = adapt_action_for_arm_mode(action, self.arm_mode)
-                latest = self.latest_executed.get()
-                self.action_queue.add_chunk(chunk.first_timestep, action, latest)
+                current_latest_action = self.latest_action.get()
+                self.action_queue.add_chunk(chunk.latest_action, action, current_latest_action)
+                self.request_in_flight.set(-1)
+                self.must_go.set(True)
+                first_step = max(chunk.latest_action, 0)
+                last_step = first_step + action.shape[0] - 1
                 print(
-                    f"[client] chunk request_id={chunk.request_id} first={chunk.first_timestep} "
+                    f"[client] chunk request_id={chunk.request_id} latest_action={chunk.latest_action} "
+                    f"action_steps={first_step}:{last_step} "
                     f"shape={list(action.shape)} strategy={self.action_queue.chunk_merge_strategy} "
                     f"prefix_steps={self.action_queue.chunk_execute_prefix_steps} "
                     f"queue={len(self.action_queue)} latency_ms={chunk.inference_latency_ms:.1f}"
@@ -402,6 +452,20 @@ class AtomicInt:
             self._value = value
 
 
+class AtomicBool:
+    def __init__(self, value: bool):
+        self._lock = threading.Lock()
+        self._value = value
+
+    def get(self) -> bool:
+        with self._lock:
+            return self._value
+
+    def set(self, value: bool) -> None:
+        with self._lock:
+            self._value = value
+
+
 def run(args) -> None:
     stop_event = threading.Event()
     signal.signal(signal.SIGINT, lambda signum, frame: stop_event.set())
@@ -416,7 +480,9 @@ def run(args) -> None:
 
     hardware = BimanualHardware(args)
     sensors = SensorWorker(hardware, args.camera_width, args.camera_height, args.image_size)
-    latest_executed = AtomicInt(-1)
+    latest_action = AtomicInt(-1)
+    request_in_flight = AtomicInt(-1)
+    must_go = AtomicBool(True)
     action_queue = ActionQueue(args.chunk_merge_strategy, args.chunk_execute_prefix_steps)
 
     channel = grpc.insecure_channel(server)
@@ -430,16 +496,18 @@ def run(args) -> None:
         print(f"[client] health ready={health.ready} message={health.message}", flush=True)
         reset = stub.Reset(rdt2_async_pb2.ResetRequest(), timeout=args.rpc_timeout)
         print(f"[client] reset ok={reset.ok} message={reset.message}", flush=True)
-        stream = ActionStreamWorker(stub, action_queue, latest_executed, stop_event, args.arm_mode)
+        stream = ActionStreamWorker(
+            stub, action_queue, latest_action, request_in_flight, must_go, stop_event, args.arm_mode
+        )
         stream.start()
 
         request_thread = threading.Thread(
             target=submit_observations,
-            args=(args, stub, sensors, latest_executed, stop_event),
+            args=(args, stub, sensors, latest_action, action_queue, request_in_flight, must_go, stop_event),
             daemon=True,
         )
         request_thread.start()
-        control_loop(args, hardware, action_queue, latest_executed, stop_event)
+        control_loop(args, hardware, action_queue, latest_action, stop_event)
         request_thread.join(timeout=2.0)
     finally:
         stop_event.set()
@@ -473,16 +541,39 @@ def maybe_save_debug_images(args, request_id: int, left: np.ndarray, right: np.n
         print(f"[client] warning: failed to save debug images request_id={request_id}: {exc}")
 
 
-def submit_observations(args, stub, sensors, latest_executed: AtomicInt, stop_event: threading.Event) -> None:
-    period = 1.0 / args.request_fps
+def submit_observations(
+    args,
+    stub,
+    sensors,
+    latest_action: AtomicInt,
+    action_queue: ActionQueue,
+    request_in_flight: AtomicInt,
+    must_go: AtomicBool,
+    stop_event: threading.Event,
+) -> None:
+    period = 1.0 / (args.request_fps if args.observation_request_policy == "fixed_fps" else args.fps)
     request_id = 0
     while not stop_event.is_set():
+        started = time.time()
+        latest = latest_action.get()
+        queue_size = len(action_queue)
+        queue_ratio = action_queue.queue_ratio()
+        force_request = must_go.get() and queue_size == 0
+
+        if args.observation_request_policy == "threshold":
+            if request_in_flight.get() >= 0:
+                sleep_remaining(started, period)
+                continue
+            if not force_request and queue_ratio > args.chunk_size_threshold:
+                sleep_remaining(started, period)
+                continue
+
         snapshot = sensors.latest.get()
         if snapshot is None:
             time.sleep(0.01)
             continue
+
         request_id += 1
-        started = time.time()
         maybe_save_debug_images(args, request_id, snapshot.left_rgb, snapshot.right_rgb)
         request = rdt2_async_pb2.ObservationRequest(
             request_id=request_id,
@@ -492,19 +583,30 @@ def submit_observations(args, stub, sensors, latest_executed: AtomicInt, stop_ev
             right_stereo_jpeg=encode_jpeg(snapshot.right_rgb, quality=args.jpeg_quality),
             state=np.zeros(20, dtype=np.float32).tolist(),
             tcp_pose_flat=snapshot.tcp_pose_flat.tolist(),
-            latest_executed_timestep=latest_executed.get(),
+            latest_action=latest,
+            action_queue_size=queue_size,
+            queue_ratio=queue_ratio,
+            must_go=force_request,
         )
+        request_in_flight.set(request_id)
         try:
             ack = stub.SubmitObservation(request, timeout=args.rpc_timeout)
+            if not ack.accepted:
+                request_in_flight.set(-1)
+            elif force_request:
+                must_go.set(False)
             if args.verbose:
                 print(
-                    f"[client] submitted request_id={ack.request_id} "
-                    f"latest={request.latest_executed_timestep} "
+                    f"[client] submitted request_id={ack.request_id} accepted={ack.accepted} "
+                    f"latest_action={request.latest_action} "
+                    f"queue={queue_size} queue_ratio={queue_ratio:.3f} must_go={force_request} "
                     f"camera_shape={snapshot.left_rgb.shape}/{snapshot.right_rgb.shape} "
                     f"right_tcp={snapshot.tcp_pose_flat[RIGHT_ARM_SLICE].round(4).tolist()} "
                     f"left_tcp={snapshot.tcp_pose_flat[LEFT_ARM_SLICE].round(4).tolist()}"
                 )
         except grpc.RpcError as exc:
+            request_in_flight.set(-1)
+            must_go.set(True)
             print(f"[client] submit failed: {exc}")
         sleep_remaining(started, period)
 
@@ -513,7 +615,7 @@ def control_loop(
     args,
     hardware: BimanualHardware,
     action_queue: ActionQueue,
-    latest_executed: AtomicInt,
+    latest_action: AtomicInt,
     stop_event: threading.Event,
 ) -> None:
     period = 1.0 / args.fps
@@ -524,7 +626,7 @@ def control_loop(
             stop_event.set()
             break
         started = time.time()
-        item = action_queue.pop_next(latest_executed.get())
+        item = action_queue.pop_next(latest_action.get())
         if item is not None:
             timestep, action = item
             target = last_target.copy()
@@ -539,7 +641,7 @@ def control_loop(
             else:
                 hardware.execute(target)
             last_target = target
-            latest_executed.set(timestep)
+            latest_action.set(timestep)
         sleep_remaining(started, period)
 
 
@@ -694,7 +796,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-fps", default=30, type=int)
     parser.add_argument("--image-size", default=384, type=int)
     parser.add_argument("--fps", default=30.0, type=float)
-    parser.add_argument("--request-fps", default=5.0, type=float)
+    parser.add_argument("--request-fps", default=5.0, type=float, help="Used only with --observation-request-policy=fixed_fps")
+    parser.add_argument(
+        "--observation-request-policy",
+        default="threshold",
+        choices=("threshold", "fixed_fps"),
+        help="threshold matches LeRobot-style queue waterline scheduling; fixed_fps preserves periodic submit",
+    )
+    parser.add_argument("--chunk-size-threshold", default=0.5, type=float)
     parser.add_argument("--instruction", default="move")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-piper", action="store_true", help="use zero arm poses and skip Piper CAN")
@@ -712,13 +821,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gripper", default=0.10, type=float)
     parser.add_argument(
         "--chunk-merge-strategy",
-        default=ActionQueue.BLEND_OVERLAP,
-        choices=(ActionQueue.BLEND_OVERLAP, ActionQueue.PREFIX_NO_MERGE),
+        default=ActionQueue.PREFIX_NO_MERGE,
+        choices=(
+            ActionQueue.PREFIX_NO_MERGE,
+            ActionQueue.BLEND_OVERLAP,
+            ActionQueue.RTC_SMOOTH,
+            ActionQueue.LATEST_ONLY,
+        ),
         help="How incoming action chunks are merged into the execution queue",
     )
     parser.add_argument(
         "--chunk-execute-prefix-steps",
-        default=0,
+        default=ActionQueue.DEFAULT_PREFIX_STEPS,
         type=int,
         help="For prefix_no_merge, execute only the first N future actions from each received chunk",
     )

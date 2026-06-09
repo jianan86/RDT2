@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10rdt2_async.proto\x12\x14rdt2.async_inference\"\x0f\n\rHealthRequest\"0\n\x0eHealthResponse\x12\r\n\x05ready\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\x0e\n\x0cResetRequest\",\n\rResetResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\xcd\x01\n\x12ObservationRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\x03\x12\x11\n\ttimestamp\x18\x02 \x01(\x01\x12\x13\n\x0binstruction\x18\x03 \x01(\t\x12\x18\n\x10left_stereo_jpeg\x18\x04 \x01(\x0c\x12\x19\n\x11right_stereo_jpeg\x18\x05 \x01(\x0c\x12\r\n\x05state\x18\x06 \x03(\x02\x12\x15\n\rtcp_pose_flat\x18\x07 \x03(\x02\x12 \n\x18latest_executed_timestep\x18\x08 \x01(\x03\"G\n\x0eObservationAck\x12\x12\n\nrequest_id\x18\x01 \x01(\x03\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x15\n\x13\x41\x63tionStreamRequest\"\xbb\x01\n\x0b\x41\x63tionChunk\x12\x12\n\nrequest_id\x18\x01 \x01(\x03\x12\x19\n\x11\x63reated_timestamp\x18\x02 \x01(\x01\x12\x13\n\x0b\x61\x63tion_flat\x18\x03 \x03(\x02\x12\x0f\n\x07horizon\x18\x04 \x01(\x05\x12\x12\n\naction_dim\x18\x05 \x01(\x05\x12\x1c\n\x14inference_latency_ms\x18\x06 \x01(\x01\x12\r\n\x05\x65rror\x18\x07 \x01(\t\x12\x16\n\x0e\x66irst_timestep\x18\x08 \x01(\x03\x32\x81\x03\n\x12RDT2AsyncInference\x12S\n\x06Health\x12#.rdt2.async_inference.HealthRequest\x1a$.rdt2.async_inference.HealthResponse\x12P\n\x05Reset\x12\".rdt2.async_inference.ResetRequest\x1a#.rdt2.async_inference.ResetResponse\x12\x63\n\x11SubmitObservation\x12(.rdt2.async_inference.ObservationRequest\x1a$.rdt2.async_inference.ObservationAck\x12_\n\rStreamActions\x12).rdt2.async_inference.ActionStreamRequest\x1a!.rdt2.async_inference.ActionChunk0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10rdt2_async.proto\x12\x14rdt2.async_inference\"\x0f\n\rHealthRequest\"0\n\x0eHealthResponse\x12\r\n\x05ready\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\x0e\n\x0cResetRequest\",\n\rResetResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\x83\x02\n\x12ObservationRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\x03\x12\x11\n\ttimestamp\x18\x02 \x01(\x01\x12\x13\n\x0binstruction\x18\x03 \x01(\t\x12\x18\n\x10left_stereo_jpeg\x18\x04 \x01(\x0c\x12\x19\n\x11right_stereo_jpeg\x18\x05 \x01(\x0c\x12\r\n\x05state\x18\x06 \x03(\x02\x12\x15\n\rtcp_pose_flat\x18\x07 \x03(\x02\x12\x15\n\rlatest_action\x18\x08 \x01(\x03\x12\x19\n\x11\x61\x63tion_queue_size\x18\t \x01(\x05\x12\x13\n\x0bqueue_ratio\x18\n \x01(\x01\x12\x0f\n\x07must_go\x18\x0b \x01(\x08\"G\n\x0eObservationAck\x12\x12\n\nrequest_id\x18\x01 \x01(\x03\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x02 \x01(\x08\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x15\n\x13\x41\x63tionStreamRequest\"\xba\x01\n\x0b\x41\x63tionChunk\x12\x12\n\nrequest_id\x18\x01 \x01(\x03\x12\x19\n\x11\x63reated_timestamp\x18\x02 \x01(\x01\x12\x13\n\x0b\x61\x63tion_flat\x18\x03 \x03(\x02\x12\x0f\n\x07horizon\x18\x04 \x01(\x05\x12\x12\n\naction_dim\x18\x05 \x01(\x05\x12\x1c\n\x14inference_latency_ms\x18\x06 \x01(\x01\x12\r\n\x05\x65rror\x18\x07 \x01(\t\x12\x15\n\rlatest_action\x18\x08 \x01(\x03\x32\x81\x03\n\x12RDT2AsyncInference\x12S\n\x06Health\x12#.rdt2.async_inference.HealthRequest\x1a$.rdt2.async_inference.HealthResponse\x12P\n\x05Reset\x12\".rdt2.async_inference.ResetRequest\x1a#.rdt2.async_inference.ResetResponse\x12\x63\n\x11SubmitObservation\x12(.rdt2.async_inference.ObservationRequest\x1a$.rdt2.async_inference.ObservationAck\x12_\n\rStreamActions\x12).rdt2.async_inference.ActionStreamRequest\x1a!.rdt2.async_inference.ActionChunk0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -40,13 +40,13 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_RESETRESPONSE']._serialized_start=125
   _globals['_RESETRESPONSE']._serialized_end=169
   _globals['_OBSERVATIONREQUEST']._serialized_start=172
-  _globals['_OBSERVATIONREQUEST']._serialized_end=377
-  _globals['_OBSERVATIONACK']._serialized_start=379
-  _globals['_OBSERVATIONACK']._serialized_end=450
-  _globals['_ACTIONSTREAMREQUEST']._serialized_start=452
-  _globals['_ACTIONSTREAMREQUEST']._serialized_end=473
-  _globals['_ACTIONCHUNK']._serialized_start=476
-  _globals['_ACTIONCHUNK']._serialized_end=663
-  _globals['_RDT2ASYNCINFERENCE']._serialized_start=666
-  _globals['_RDT2ASYNCINFERENCE']._serialized_end=1051
+  _globals['_OBSERVATIONREQUEST']._serialized_end=431
+  _globals['_OBSERVATIONACK']._serialized_start=433
+  _globals['_OBSERVATIONACK']._serialized_end=504
+  _globals['_ACTIONSTREAMREQUEST']._serialized_start=506
+  _globals['_ACTIONSTREAMREQUEST']._serialized_end=527
+  _globals['_ACTIONCHUNK']._serialized_start=530
+  _globals['_ACTIONCHUNK']._serialized_end=716
+  _globals['_RDT2ASYNCINFERENCE']._serialized_start=719
+  _globals['_RDT2ASYNCINFERENCE']._serialized_end=1104
 # @@protoc_insertion_point(module_scope)

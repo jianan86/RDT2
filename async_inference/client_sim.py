@@ -20,8 +20,11 @@ def stream_actions(stub, stop_event: threading.Event) -> None:
                 print(f"[client] action request_id={chunk.request_id} error={chunk.error}")
                 continue
             action = unflatten_action(list(chunk.action_flat), chunk.horizon, chunk.action_dim)
+            first_step = max(chunk.latest_action, 0)
+            last_step = first_step + chunk.horizon - 1
             print(
-                f"[client] action request_id={chunk.request_id} first_timestep={chunk.first_timestep} "
+                f"[client] action request_id={chunk.request_id} latest_action={chunk.latest_action} "
+                f"action_steps={first_step}:{last_step} "
                 f"shape={list(action.shape)} latency_ms={chunk.inference_latency_ms:.1f}"
             )
     except grpc.RpcError as exc:
@@ -45,7 +48,7 @@ def run(args) -> None:
     thread.start()
 
     try:
-        latest_executed_timestep = -1
+        latest_action = -1
         for request_id in range(1, args.num_requests + 1):
             left = random_rgb(args.image_size, args.image_size)
             right = random_rgb(args.image_size, args.image_size)
@@ -57,14 +60,17 @@ def run(args) -> None:
                 right_stereo_jpeg=encode_jpeg(right),
                 state=np.zeros(args.state_dim, dtype=np.float32).tolist(),
                 tcp_pose_flat=np.zeros(14, dtype=np.float32).tolist(),
-                latest_executed_timestep=latest_executed_timestep,
+                latest_action=latest_action,
+                action_queue_size=0,
+                queue_ratio=0.0,
+                must_go=True,
             )
             ack = stub.SubmitObservation(request, timeout=args.rpc_timeout)
             print(
                 f"[client] submitted request_id={ack.request_id} "
                 f"accepted={ack.accepted} message={ack.message}"
             )
-            latest_executed_timestep += 1
+            latest_action += 1
             time.sleep(args.interval)
 
         time.sleep(args.wait_after_send)
