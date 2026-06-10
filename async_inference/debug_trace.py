@@ -153,6 +153,11 @@ def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
     if robot is None:
         return {}
     names = (
+        "get_connect_status",
+        "GetArmStatus",
+        "GetArmEnableStatus",
+        "GetArmModeCtrl",
+        "GetArmCtrlCode151",
         "GetArmStatusMsgs",
         "GetArmEndPoseMsgs",
         "GetArmJointMsgs",
@@ -166,10 +171,25 @@ def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
         if func is None:
             continue
         try:
-            snapshot[name] = _jsonable(func())
+            value = func()
+            item = _jsonable(value)
+            if isinstance(item, dict):
+                item.setdefault("_repr", repr(value))
+            snapshot[name] = item
         except Exception as exc:
             snapshot[name] = {"error": repr(exc)}
     return snapshot
+
+
+PIPER_FATAL_STATUS_TERMS = (
+    "TARGET_POS_EXCEEDS_LIMIT",
+    "REACH_TARGET_POS_FAILED",
+)
+
+
+def find_piper_status_errors(snapshot: dict[str, Any]) -> list[str]:
+    text = json.dumps(_jsonable(snapshot), sort_keys=True)
+    return [term for term in PIPER_FATAL_STATUS_TERMS if term in text]
 
 
 def _round_list(values: np.ndarray, digits: int = 5) -> list[float]:

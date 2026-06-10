@@ -16,7 +16,13 @@ import grpc
 import numpy as np
 import yaml
 from async_inference.codec import encode_jpeg, save_rgb_png, unflatten_action
-from async_inference.debug_trace import JsonlTraceWriter, StopDetector, collect_sdk_snapshot, summarize_action
+from async_inference.debug_trace import (
+    JsonlTraceWriter,
+    StopDetector,
+    collect_sdk_snapshot,
+    find_piper_status_errors,
+    summarize_action,
+)
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
 from async_inference.pose_utils import (
     LEFT_ARM_SLICE,
@@ -97,11 +103,13 @@ class PiperRobot:
         dry_run: bool,
         no_piper: bool,
         sdk_trace_writer: Optional[JsonlTraceWriter] = None,
+        stop_on_piper_status_error: bool = True,
     ):
         self.side = side
         self.can_name = can_name
         self.dry_run = dry_run
         self.sdk_trace_writer = sdk_trace_writer
+        self.stop_on_piper_status_error = stop_on_piper_status_error
         self.robot = None
         if no_piper:
             print(f"[piper:{side}] disabled")
@@ -152,9 +160,18 @@ class PiperRobot:
             raise
         finally:
             event["latency_ms"] = (time.time() - started) * 1000.0
+            sdk_snapshot = collect_sdk_snapshot(self.robot)
+            event["sdk_snapshot"] = sdk_snapshot
+            status_errors = find_piper_status_errors(sdk_snapshot)
+            if status_errors:
+                event["piper_status_errors"] = status_errors
             if self.sdk_trace_writer is not None:
-                event["sdk_snapshot"] = collect_sdk_snapshot(self.robot)
                 self.sdk_trace_writer.write(event)
+            if status_errors and self.stop_on_piper_status_error:
+                raise RuntimeError(
+                    f"Piper {self.side} status error after target {event['target']}: "
+                    f"{status_errors}"
+                )
 
 
 class PikaGripper:
@@ -238,7 +255,14 @@ class PikaGripper:
 class BimanualHardware:
     def __init__(self, args, sdk_trace_writer: Optional[JsonlTraceWriter] = None):
         self.arm_mode = args.arm_mode
-        self.right_arm = PiperRobot("right", args.right_piper_can, args.dry_run, args.no_piper, sdk_trace_writer)
+        self.right_arm = PiperRobot(
+            "right",
+            args.right_piper_can,
+            args.dry_run,
+            args.no_piper,
+            sdk_trace_writer,
+            not args.ignore_piper_status_errors,
+        )
         self.right_gripper = PikaGripper(
             "right",
             args.right_gripper_port,
@@ -252,7 +276,14 @@ class BimanualHardware:
         self.left_arm = None
         self.left_gripper = None
         if self.arm_mode == "dual":
-            self.left_arm = PiperRobot("left", args.left_piper_can, args.dry_run, args.no_piper, sdk_trace_writer)
+            self.left_arm = PiperRobot(
+                "left",
+                args.left_piper_can,
+                args.dry_run,
+                args.no_piper,
+                sdk_trace_writer,
+                not args.ignore_piper_status_errors,
+            )
             self.left_gripper = PikaGripper(
                 "left",
                 args.left_gripper_port,
@@ -950,6 +981,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-image-every", default=1, type=int)
     parser.add_argument("--debug-trace-dir", default="", help="write JSONL control/chunk/SDK traces to this directory")
     parser.add_argument("--debug-candump-dir", default="", help="best-effort candump logs for Piper CAN interfaces")
+    parser.add_argument(
+        "--ignore-piper-status-errors",
+        action="store_true",
+        help="continue sending targets even if Piper reports target-limit or reach-failed status",
+    )
     parser.add_argument("--stop-detector-window", default=0.7, type=float)
     parser.add_argument("--stop-target-pos-threshold", default=0.01, type=float)
     parser.add_argument("--stop-target-rot-threshold", default=0.05, type=float)
