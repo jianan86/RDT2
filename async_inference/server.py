@@ -12,6 +12,7 @@ import grpc
 import numpy as np
 
 from async_inference.codec import decode_jpeg, flatten_action, save_rgb_png
+from async_inference.debug_trace import summarize_action
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
 from async_inference.rdt2_policy import (
     ABS_EEF_DIM,
@@ -162,6 +163,7 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
                 with self.predicted_latest_actions_lock:
                     self.predicted_latest_actions.add(item.latest_action)
                 action = self.policy.step(left, right, state, item.instruction, tcp_pose_flat)
+                action_summary = summarize_action(action, pose_slices=(slice(0, 7), slice(7, 14)))
                 action_flat, horizon, action_dim = flatten_action(action)
                 latency_ms = (time.time() - started) * 1000.0
                 chunk = rdt2_async_pb2.ActionChunk(
@@ -178,7 +180,10 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
                 print(
                     f"[server] completed request_id={item.request_id} "
                     f"latest_action={item.latest_action} action_steps={first_action}:{last_action} "
-                    f"shape=[{horizon}, {action_dim}] latency_ms={latency_ms:.1f}"
+                    f"shape=[{horizon}, {action_dim}] latency_ms={latency_ms:.1f} "
+                    f"action_static={action_summary['near_static']} "
+                    f"right_pos_delta={action_summary['arms'][0]['total_pos_delta']:.5f} "
+                    f"left_pos_delta={action_summary['arms'][1]['total_pos_delta']:.5f}"
                 )
             except Exception as exc:
                 chunk = rdt2_async_pb2.ActionChunk(

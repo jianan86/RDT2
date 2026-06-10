@@ -7,6 +7,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from async_inference.debug_trace import StopDetector, collect_sdk_snapshot, summarize_action
 from async_inference.pose_utils import (
     IDENTITY_POSE10D,
     ee_pose14_to_tcp_pose14,
@@ -204,6 +205,69 @@ def test_server_filters_duplicate_latest_action_unless_must_go():
         assert ack.accepted
     finally:
         service.shutdown()
+
+
+def test_summarize_action_marks_static_pose_chunk():
+    action = np.zeros((4, 14), dtype=np.float32)
+    action[:, 0] = 0.001
+
+    summary = summarize_action(action, pose_slices=(slice(0, 7), slice(7, 14)))
+
+    assert summary["near_static"]
+    assert summary["arms"][0]["total_pos_delta"] == 0.0
+
+
+def test_summarize_action_marks_moving_pose_chunk():
+    action = np.zeros((4, 14), dtype=np.float32)
+    action[:, 0] = np.linspace(0.0, 0.02, 4, dtype=np.float32)
+
+    summary = summarize_action(action, pose_slices=(slice(0, 7), slice(7, 14)))
+
+    assert not summary["near_static"]
+    assert summary["arms"][0]["total_pos_delta"] > 0.01
+
+
+def test_stop_detector_fires_when_target_moves_but_actual_stays_put():
+    detector = StopDetector(window_seconds=0.5)
+    target0 = np.zeros(14, dtype=np.float32)
+    actual = np.zeros(14, dtype=np.float32)
+    target1 = target0.copy()
+    target1[0] = 0.02
+
+    assert detector.update(0.0, target0, actual, (slice(0, 7), slice(7, 14))) == []
+    events = detector.update(0.5, target1, actual, (slice(0, 7), slice(7, 14)))
+
+    assert len(events) == 1
+    assert events[0]["arm"] == 0
+
+
+def test_stop_detector_does_not_fire_when_actual_follows_target():
+    detector = StopDetector(window_seconds=0.5)
+    target0 = np.zeros(14, dtype=np.float32)
+    target1 = target0.copy()
+    target1[0] = 0.02
+
+    detector.update(0.0, target0, target0, (slice(0, 7), slice(7, 14)))
+    events = detector.update(0.5, target1, target1, (slice(0, 7), slice(7, 14)))
+
+    assert events == []
+
+
+def test_collect_sdk_snapshot_handles_missing_and_failing_methods():
+    class FakeRobot:
+        def GetArmStatusMsgs(self):
+            raise RuntimeError("status unavailable")
+
+        def GetArmEndPoseMsgs(self):
+            class Msg:
+                value = 3
+
+            return Msg()
+
+    snapshot = collect_sdk_snapshot(FakeRobot())
+
+    assert "status unavailable" in snapshot["GetArmStatusMsgs"]["error"]
+    assert snapshot["GetArmEndPoseMsgs"]["value"] == 3
 
 
 def test_action_chunk_carries_latest_action_only():

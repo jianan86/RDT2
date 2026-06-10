@@ -8,6 +8,7 @@ from typing import Iterator
 import numpy as np
 import yaml
 
+from async_inference.debug_trace import summarize_action
 from async_inference.pose_utils import ABS_POSE_DIM, relative_action_to_absolute_tcp, validate_pose14
 
 
@@ -136,7 +137,14 @@ class RDT2Policy:
         action = _postprocess_gripper(action.astype(np.float32, copy=False))
         if action.shape != (self.horizon, self.action_dim):
             raise ValueError(f"expected action shape ({self.horizon}, {self.action_dim}), got {action.shape}")
-        print(f"[policy] inference+postprocess latency {(time.time() - started) * 1000:.1f} ms")
+        raw_summary = summarize_action(raw_action)
+        action_summary = summarize_action(action, pose_slices=(slice(0, 7), slice(7, 14)))
+        print(
+            f"[policy] inference+postprocess latency {(time.time() - started) * 1000:.1f} ms "
+            f"raw_total_l2={raw_summary['total_l2']:.5f} action_static={action_summary['near_static']} "
+            f"right_pos_delta={action_summary['arms'][0]['total_pos_delta']:.5f} "
+            f"left_pos_delta={action_summary['arms'][1]['total_pos_delta']:.5f}"
+        )
         return action
 
 

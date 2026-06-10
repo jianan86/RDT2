@@ -16,6 +16,7 @@ import grpc
 import numpy as np
 import yaml
 from async_inference.codec import encode_jpeg, save_rgb_png, unflatten_action
+from async_inference.debug_trace import JsonlTraceWriter, StopDetector, collect_sdk_snapshot, summarize_action
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
 from async_inference.pose_utils import (
     LEFT_ARM_SLICE,
@@ -89,10 +90,18 @@ class SensorWorker:
 
 
 class PiperRobot:
-    def __init__(self, side: str, can_name: str, dry_run: bool, no_piper: bool):
+    def __init__(
+        self,
+        side: str,
+        can_name: str,
+        dry_run: bool,
+        no_piper: bool,
+        sdk_trace_writer: Optional[JsonlTraceWriter] = None,
+    ):
         self.side = side
         self.can_name = can_name
         self.dry_run = dry_run
+        self.sdk_trace_writer = sdk_trace_writer
         self.robot = None
         if no_piper:
             print(f"[piper:{side}] disabled")
@@ -118,8 +127,7 @@ class PiperRobot:
         if self.robot is None or self.dry_run:
             return
         x, y, z, roll, pitch, yaw = target[:6].tolist()
-        self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
-        self.robot.EndPoseCtrl(
+        end_pose_args = (
             int(round(x * 1_000_000.0)),
             int(round(y * 1_000_000.0)),
             int(round(z * 1_000_000.0)),
@@ -127,6 +135,26 @@ class PiperRobot:
             int(round(np.degrees(pitch) * 1000.0)),
             int(round(np.degrees(yaw) * 1000.0)),
         )
+        started = time.time()
+        event = {
+            "event": "piper_execute_pose",
+            "side": self.side,
+            "can_name": self.can_name,
+            "target": np.asarray(target[:6], dtype=np.float32).round(5).tolist(),
+            "end_pose_args": list(end_pose_args),
+        }
+        try:
+            event["motion_ctrl_result"] = self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
+            event["end_pose_result"] = self.robot.EndPoseCtrl(*end_pose_args)
+        except Exception as exc:
+            event["error"] = repr(exc)
+            print(f"[piper:{self.side}] execute_pose failed: {exc}")
+            raise
+        finally:
+            event["latency_ms"] = (time.time() - started) * 1000.0
+            if self.sdk_trace_writer is not None:
+                event["sdk_snapshot"] = collect_sdk_snapshot(self.robot)
+                self.sdk_trace_writer.write(event)
 
 
 class PikaGripper:
@@ -208,9 +236,9 @@ class PikaGripper:
 
 
 class BimanualHardware:
-    def __init__(self, args):
+    def __init__(self, args, sdk_trace_writer: Optional[JsonlTraceWriter] = None):
         self.arm_mode = args.arm_mode
-        self.right_arm = PiperRobot("right", args.right_piper_can, args.dry_run, args.no_piper)
+        self.right_arm = PiperRobot("right", args.right_piper_can, args.dry_run, args.no_piper, sdk_trace_writer)
         self.right_gripper = PikaGripper(
             "right",
             args.right_gripper_port,
@@ -224,7 +252,7 @@ class BimanualHardware:
         self.left_arm = None
         self.left_gripper = None
         if self.arm_mode == "dual":
-            self.left_arm = PiperRobot("left", args.left_piper_can, args.dry_run, args.no_piper)
+            self.left_arm = PiperRobot("left", args.left_piper_can, args.dry_run, args.no_piper, sdk_trace_writer)
             self.left_gripper = PikaGripper(
                 "left",
                 args.left_gripper_port,
@@ -389,6 +417,7 @@ class ActionStreamWorker:
         must_go,
         stop_event: threading.Event,
         arm_mode: str,
+        chunk_trace_writer: Optional[JsonlTraceWriter] = None,
     ):
         self.stub = stub
         self.action_queue = action_queue
@@ -397,6 +426,7 @@ class ActionStreamWorker:
         self.must_go = must_go
         self.stop_event = stop_event
         self.arm_mode = arm_mode
+        self.chunk_trace_writer = chunk_trace_writer
         self.thread = threading.Thread(target=self._loop, name="action-stream", daemon=True)
 
     def start(self) -> None:
@@ -420,18 +450,34 @@ class ActionStreamWorker:
                     print(f"[client] ignoring action with shape={list(action.shape)}")
                     continue
                 action = adapt_action_for_arm_mode(action, self.arm_mode)
+                action_summary = summarize_action(action, pose_slices=(RIGHT_ARM_SLICE, LEFT_ARM_SLICE))
                 current_latest_action = self.latest_action.get()
                 self.action_queue.add_chunk(chunk.latest_action, action, current_latest_action)
                 self.request_in_flight.set(-1)
                 self.must_go.set(True)
                 first_step = chunk.latest_action + 1
                 last_step = first_step + action.shape[0] - 1
+                if self.chunk_trace_writer is not None:
+                    self.chunk_trace_writer.write({
+                        "event": "action_chunk",
+                        "request_id": chunk.request_id,
+                        "chunk_latest_action": chunk.latest_action,
+                        "current_latest_action": current_latest_action,
+                        "first_step": first_step,
+                        "last_step": last_step,
+                        "queue_size": len(self.action_queue),
+                        "latency_ms": chunk.inference_latency_ms,
+                        "summary": action_summary,
+                    })
                 print(
                     f"[client] chunk request_id={chunk.request_id} latest_action={chunk.latest_action} "
                     f"action_steps={first_step}:{last_step} "
                     f"shape={list(action.shape)} strategy={self.action_queue.chunk_merge_strategy} "
                     f"prefix_steps={self.action_queue.chunk_execute_prefix_steps} "
-                    f"queue={len(self.action_queue)} latency_ms={chunk.inference_latency_ms:.1f}"
+                    f"queue={len(self.action_queue)} latency_ms={chunk.inference_latency_ms:.1f} "
+                    f"action_static={action_summary['near_static']} "
+                    f"right_pos_delta={action_summary['arms'][0]['total_pos_delta']:.5f} "
+                    f"left_pos_delta={action_summary['arms'][1]['total_pos_delta']:.5f}"
                 )
         except grpc.RpcError as exc:
             if not self.stop_event.is_set():
@@ -466,6 +512,53 @@ class AtomicBool:
             self._value = value
 
 
+class ClientDebugTrace:
+    def __init__(self, args):
+        self.base_dir = Path(args.debug_trace_dir).expanduser() if args.debug_trace_dir else None
+        self.control_writer = None
+        self.chunk_writer = None
+        self.sdk_writer = None
+        self._candump_files = []
+        self._candump_procs = []
+        if self.base_dir is not None:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self.control_writer = JsonlTraceWriter(self.base_dir / "client_control.jsonl")
+            self.chunk_writer = JsonlTraceWriter(self.base_dir / "client_chunks.jsonl")
+            self.sdk_writer = JsonlTraceWriter(self.base_dir / "client_sdk.jsonl")
+        if args.debug_candump_dir:
+            self._start_candump(args)
+
+    def _start_candump(self, args) -> None:
+        candump_dir = Path(args.debug_candump_dir).expanduser()
+        candump_dir.mkdir(parents=True, exist_ok=True)
+        can_names = [args.right_piper_can]
+        if args.arm_mode == "dual":
+            can_names.append(args.left_piper_can)
+        for can_name in can_names:
+            if not can_name:
+                continue
+            path = candump_dir / f"{can_name}.log"
+            try:
+                f = path.open("a", encoding="utf-8")
+                proc = subprocess.Popen(["candump", "-L", can_name], stdout=f, stderr=subprocess.STDOUT)
+            except Exception as exc:
+                print(f"[debug] failed to start candump for {can_name}: {exc}")
+                continue
+            self._candump_files.append(f)
+            self._candump_procs.append(proc)
+            print(f"[debug] candump {can_name} -> {path}")
+
+    def close(self) -> None:
+        for proc in self._candump_procs:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        for f in self._candump_files:
+            f.close()
+
+
 def run(args) -> None:
     stop_event = threading.Event()
     signal.signal(signal.SIGINT, lambda signum, frame: stop_event.set())
@@ -478,7 +571,8 @@ def run(args) -> None:
     else:
         server = args.server
 
-    hardware = BimanualHardware(args)
+    debug_trace = ClientDebugTrace(args)
+    hardware = BimanualHardware(args, debug_trace.sdk_writer)
     sensors = SensorWorker(hardware, args.camera_width, args.camera_height, args.image_size)
     latest_action = AtomicInt(-1)
     request_in_flight = AtomicInt(-1)
@@ -497,7 +591,7 @@ def run(args) -> None:
         reset = stub.Reset(rdt2_async_pb2.ResetRequest(), timeout=args.rpc_timeout)
         print(f"[client] reset ok={reset.ok} message={reset.message}", flush=True)
         stream = ActionStreamWorker(
-            stub, action_queue, latest_action, request_in_flight, must_go, stop_event, args.arm_mode
+            stub, action_queue, latest_action, request_in_flight, must_go, stop_event, args.arm_mode, debug_trace.chunk_writer
         )
         stream.start()
 
@@ -507,12 +601,13 @@ def run(args) -> None:
             daemon=True,
         )
         request_thread.start()
-        control_loop(args, hardware, action_queue, latest_action, stop_event)
+        control_loop(args, hardware, sensors, action_queue, latest_action, stop_event, debug_trace.control_writer)
         request_thread.join(timeout=2.0)
     finally:
         stop_event.set()
         sensors.stop()
         hardware.close()
+        debug_trace.close()
         if stream is not None:
             stream.join()
         channel.close()
@@ -614,12 +709,22 @@ def submit_observations(
 def control_loop(
     args,
     hardware: BimanualHardware,
+    sensors: SensorWorker,
     action_queue: ActionQueue,
     latest_action: AtomicInt,
     stop_event: threading.Event,
+    control_trace_writer: Optional[JsonlTraceWriter] = None,
 ) -> None:
     period = 1.0 / args.fps
     last_target = hardware.read_tcp_pose_flat()
+    stop_detector = StopDetector(
+        window_seconds=args.stop_detector_window,
+        target_pos_threshold=args.stop_target_pos_threshold,
+        target_rot_threshold=args.stop_target_rot_threshold,
+        actual_pos_threshold=args.stop_actual_pos_threshold,
+        actual_rot_threshold=args.stop_actual_rot_threshold,
+    )
+    arm_slices = (RIGHT_ARM_SLICE, LEFT_ARM_SLICE)
     deadline = None if args.run_seconds <= 0 else time.time() + args.run_seconds
     while not stop_event.is_set():
         if deadline is not None and time.time() >= deadline:
@@ -640,6 +745,35 @@ def control_loop(
                 )
             else:
                 hardware.execute(target)
+            snapshot = sensors.latest.get()
+            actual = snapshot.tcp_pose_flat.copy() if snapshot is not None else hardware.read_tcp_pose_flat()
+            action_summary = summarize_action(action[None, :], pose_slices=arm_slices)
+            target_delta = target - last_target
+            actual_error = target - actual
+            stop_events = stop_detector.update(time.time(), target, actual, arm_slices)
+            if control_trace_writer is not None:
+                control_trace_writer.write({
+                    "event": "control_step",
+                    "timestep": timestep,
+                    "queue_size": len(action_queue),
+                    "action": np.asarray(action, dtype=np.float32).round(5).tolist(),
+                    "target": target.round(5).tolist(),
+                    "last_target": last_target.round(5).tolist(),
+                    "actual": actual.round(5).tolist(),
+                    "target_delta": target_delta.round(5).tolist(),
+                    "actual_error": actual_error.round(5).tolist(),
+                    "action_summary": action_summary,
+                    "stop_events": stop_events,
+                })
+            for event in stop_events:
+                print(
+                    f"[stop-detector] arm={event['arm']} timestep={timestep} "
+                    f"window={event['window_seconds']:.2f}s "
+                    f"target_pos_delta={event['target_pos_delta']:.5f} "
+                    f"actual_pos_delta={event['actual_pos_delta']:.5f} "
+                    f"target_rot_delta={event['target_rot_delta']:.5f} "
+                    f"actual_rot_delta={event['actual_rot_delta']:.5f}"
+                )
             last_target = target
             latest_action.set(timestep)
         sleep_remaining(started, period)
@@ -814,6 +948,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-image-dir", default="")
     parser.add_argument("--debug-image-limit", default=20, type=int)
     parser.add_argument("--debug-image-every", default=1, type=int)
+    parser.add_argument("--debug-trace-dir", default="", help="write JSONL control/chunk/SDK traces to this directory")
+    parser.add_argument("--debug-candump-dir", default="", help="best-effort candump logs for Piper CAN interfaces")
+    parser.add_argument("--stop-detector-window", default=0.7, type=float)
+    parser.add_argument("--stop-target-pos-threshold", default=0.01, type=float)
+    parser.add_argument("--stop-target-rot-threshold", default=0.05, type=float)
+    parser.add_argument("--stop-actual-pos-threshold", default=0.002, type=float)
+    parser.add_argument("--stop-actual-rot-threshold", default=0.01, type=float)
     parser.add_argument("--max-pos-step", default=0.01, type=float)
     parser.add_argument("--max-rot-step", default=0.05, type=float)
     parser.add_argument("--max-gripper-step", default=0.005, type=float)
