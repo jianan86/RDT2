@@ -175,6 +175,7 @@ def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
             item = _jsonable(value)
             if isinstance(item, dict):
                 item.setdefault("_repr", repr(value))
+                item.setdefault("_str", str(value))
             snapshot[name] = item
         except Exception as exc:
             snapshot[name] = {"error": repr(exc)}
@@ -183,6 +184,9 @@ def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
 
 PIPER_FATAL_STATUS_TERMS = (
     "TARGET_POS_EXCEEDS_LIMIT",
+)
+
+PIPER_WARNING_STATUS_TERMS = (
     "REACH_TARGET_POS_FAILED",
 )
 
@@ -190,6 +194,11 @@ PIPER_FATAL_STATUS_TERMS = (
 def find_piper_status_errors(snapshot: dict[str, Any]) -> list[str]:
     text = json.dumps(_jsonable(snapshot), sort_keys=True)
     return [term for term in PIPER_FATAL_STATUS_TERMS if term in text]
+
+
+def find_piper_status_warnings(snapshot: dict[str, Any]) -> list[str]:
+    text = json.dumps(_jsonable(snapshot), sort_keys=True)
+    return [term for term in PIPER_WARNING_STATUS_TERMS if term in text]
 
 
 def _round_list(values: np.ndarray, digits: int = 5) -> list[float]:

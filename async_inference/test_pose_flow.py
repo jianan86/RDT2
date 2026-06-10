@@ -7,7 +7,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from async_inference.debug_trace import StopDetector, collect_sdk_snapshot, find_piper_status_errors, summarize_action
+from async_inference.debug_trace import (
+    StopDetector,
+    collect_sdk_snapshot,
+    find_piper_status_errors,
+    find_piper_status_warnings,
+    summarize_action,
+)
 from async_inference.pose_utils import (
     IDENTITY_POSE10D,
     ee_pose14_to_tcp_pose14,
@@ -270,16 +276,15 @@ def test_collect_sdk_snapshot_handles_missing_and_failing_methods():
     assert snapshot["GetArmEndPoseMsgs"]["value"] == 3
 
 
-def test_find_piper_status_errors_reads_snapshot_repr():
+def test_find_piper_status_errors_and_warnings_read_snapshot_str():
     snapshot = {
         "GetArmStatus": {
-            "_repr": "Arm Status: TARGET_POS_EXCEEDS_LIMIT(0x4) Motion Status: REACH_TARGET_POS_FAILED(0x1)"
+            "_str": "Arm Status: TARGET_POS_EXCEEDS_LIMIT(0x4) Motion Status: REACH_TARGET_POS_FAILED(0x1)"
         }
     }
 
-    errors = find_piper_status_errors(snapshot)
-
-    assert errors == ["TARGET_POS_EXCEEDS_LIMIT", "REACH_TARGET_POS_FAILED"]
+    assert find_piper_status_errors(snapshot) == ["TARGET_POS_EXCEEDS_LIMIT"]
+    assert find_piper_status_warnings(snapshot) == ["REACH_TARGET_POS_FAILED"]
 
 
 def test_action_chunk_carries_latest_action_only():

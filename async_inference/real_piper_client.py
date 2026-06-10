@@ -21,6 +21,7 @@ from async_inference.debug_trace import (
     StopDetector,
     collect_sdk_snapshot,
     find_piper_status_errors,
+    find_piper_status_warnings,
     summarize_action,
 )
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
@@ -163,8 +164,11 @@ class PiperRobot:
             sdk_snapshot = collect_sdk_snapshot(self.robot)
             event["sdk_snapshot"] = sdk_snapshot
             status_errors = find_piper_status_errors(sdk_snapshot)
+            status_warnings = find_piper_status_warnings(sdk_snapshot)
             if status_errors:
                 event["piper_status_errors"] = status_errors
+            if status_warnings:
+                event["piper_status_warnings"] = status_warnings
             if self.sdk_trace_writer is not None:
                 self.sdk_trace_writer.write(event)
             if status_errors and self.stop_on_piper_status_error:
@@ -261,7 +265,7 @@ class BimanualHardware:
             args.dry_run,
             args.no_piper,
             sdk_trace_writer,
-            not args.ignore_piper_status_errors,
+            args.diagnostic_stop_on_piper_status_errors and not args.ignore_piper_status_errors,
         )
         self.right_gripper = PikaGripper(
             "right",
@@ -282,7 +286,7 @@ class BimanualHardware:
                 args.dry_run,
                 args.no_piper,
                 sdk_trace_writer,
-                not args.ignore_piper_status_errors,
+                args.diagnostic_stop_on_piper_status_errors and not args.ignore_piper_status_errors,
             )
             self.left_gripper = PikaGripper(
                 "left",
@@ -982,9 +986,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-trace-dir", default="", help="write JSONL control/chunk/SDK traces to this directory")
     parser.add_argument("--debug-candump-dir", default="", help="best-effort candump logs for Piper CAN interfaces")
     parser.add_argument(
+        "--diagnostic-stop-on-piper-status-errors",
+        action="store_true",
+        help="diagnostic mode: stop the client when Piper reports fatal target-limit status",
+    )
+    parser.add_argument(
         "--ignore-piper-status-errors",
         action="store_true",
-        help="continue sending targets even if Piper reports target-limit or reach-failed status",
+        help="compatibility no-op unless diagnostic stop mode is enabled",
     )
     parser.add_argument("--stop-detector-window", default=0.7, type=float)
     parser.add_argument("--stop-target-pos-threshold", default=0.01, type=float)
