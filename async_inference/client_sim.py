@@ -20,7 +20,7 @@ def stream_actions(stub, stop_event: threading.Event) -> None:
                 print(f"[client] action request_id={chunk.request_id} error={chunk.error}")
                 continue
             action = unflatten_action(list(chunk.action_flat), chunk.horizon, chunk.action_dim)
-            first_step = max(chunk.latest_action, 0)
+            first_step = chunk.latest_action + 1
             last_step = first_step + chunk.horizon - 1
             print(
                 f"[client] action request_id={chunk.request_id} latest_action={chunk.latest_action} "

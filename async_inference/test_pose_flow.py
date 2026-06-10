@@ -106,7 +106,7 @@ def test_action_queue_prefix_no_merge_filters_stale_and_takes_first_k():
     old = np.zeros((4, 14), dtype=np.float32)
     old[:, 0] = 1.0
     new = np.zeros((4, 14), dtype=np.float32)
-    new[:, 0] = 3.0
+    new[:, 0] = np.arange(4, dtype=np.float32) + 30.0
 
     queue = ActionQueue(
         chunk_merge_strategy=ActionQueue.PREFIX_NO_MERGE,
@@ -119,13 +119,13 @@ def test_action_queue_prefix_no_merge_filters_stale_and_takes_first_k():
     assert first is not None
     timestep, action = first
     assert timestep == 13
-    assert action[0] == 3.0
+    assert action[0] == 30.0
 
     second = queue.pop_next(latest_action=13)
     assert second is not None
     timestep, action = second
     assert timestep == 14
-    assert action[0] == 3.0
+    assert action[0] == 31.0
 
     assert queue.pop_next(latest_action=14) is None
 
@@ -141,6 +141,7 @@ def test_action_queue_default_prefix_no_merge_takes_first_8_future_steps():
 
     assert len(queue) == 0
     assert [item[0] for item in popped if item is not None] == list(range(10, 18))
+    assert [item[1][0] for item in popped if item is not None] == list(range(8))
 
 
 def test_action_queue_derives_steps_from_latest_action():
@@ -158,9 +159,9 @@ def test_action_queue_derives_steps_from_latest_action():
 
 def test_action_queue_drops_expired_and_blends_overlap_by_timestep():
     old = np.zeros((4, 14), dtype=np.float32)
-    old[:, 0] = 1.0
+    old[:, 0] = np.arange(4, dtype=np.float32) + 10.0
     new = np.zeros((4, 14), dtype=np.float32)
-    new[:, 0] = 3.0
+    new[:, 0] = np.arange(4, dtype=np.float32) + 30.0
 
     queue = ActionQueue(chunk_merge_strategy=ActionQueue.BLEND_OVERLAP)
     queue.add_chunk(chunk_latest_action=9, action=old, current_latest_action=9)
@@ -170,11 +171,12 @@ def test_action_queue_drops_expired_and_blends_overlap_by_timestep():
     assert first is not None
     timestep, action = first
     assert timestep == 12
-    assert 1.0 < action[0] < 3.0
+    np.testing.assert_allclose(action[0], 18.0)
 
     second = queue.pop_next(latest_action=12)
     assert second is not None
     assert second[0] == 13
+    np.testing.assert_allclose(second[1][0], 25.0)
 
 
 def test_server_filters_duplicate_latest_action_unless_must_go():

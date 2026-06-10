@@ -173,7 +173,7 @@ class RDT2AsyncService(rdt2_async_pb2_grpc.RDT2AsyncInferenceServicer):
                     inference_latency_ms=latency_ms,
                     latest_action=item.latest_action,
                 )
-                first_action = max(item.latest_action, 0)
+                first_action = item.latest_action + 1
                 last_action = first_action + horizon - 1
                 print(
                     f"[server] completed request_id={item.request_id} "

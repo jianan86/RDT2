@@ -304,7 +304,7 @@ class ActionQueue:
         action = np.asarray(action, dtype=np.float32)
         if current_latest_action is None:
             current_latest_action = chunk_latest_action
-        base_timestep = max(int(chunk_latest_action), 0)
+        base_timestep = int(chunk_latest_action) + 1
         incoming = self._future_actions(base_timestep, action, int(current_latest_action))
 
         with self._lock:
@@ -424,7 +424,7 @@ class ActionStreamWorker:
                 self.action_queue.add_chunk(chunk.latest_action, action, current_latest_action)
                 self.request_in_flight.set(-1)
                 self.must_go.set(True)
-                first_step = max(chunk.latest_action, 0)
+                first_step = chunk.latest_action + 1
                 last_step = first_step + action.shape[0] - 1
                 print(
                     f"[client] chunk request_id={chunk.request_id} latest_action={chunk.latest_action} "
