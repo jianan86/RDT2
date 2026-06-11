@@ -10,9 +10,10 @@ import math
 import shutil
 import sys
 import tarfile
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -68,6 +69,22 @@ class EpisodeStreams:
     left_gripper: list[TimedFile]
 
 
+@dataclass(frozen=True)
+class EncodedSample:
+    image: bytes
+    action: bytes
+    meta: bytes
+
+
+@dataclass(frozen=True)
+class EpisodeResult:
+    episode_key: str
+    samples: list[EncodedSample]
+    skipped_sync: int
+    skipped_sync_before_sample: list[int]
+    skipped_horizon: int
+
+
 class ShardWriter:
     def __init__(self, output_root: Path, samples_per_shard: int) -> None:
         self.output_root = output_root
@@ -95,14 +112,22 @@ class ShardWriter:
         self.tar = tarfile.open(shard_path, "w")
 
     def write_sample(self, sample_id: int, image: Image.Image, action: np.ndarray, meta: dict[str, Any]) -> None:
+        self.write_encoded_sample(
+            sample_id,
+            image=encode_jpeg(image),
+            action=encode_npy(action),
+            meta=json.dumps(meta).encode("utf-8"),
+        )
+
+    def write_encoded_sample(self, sample_id: int, *, image: bytes, action: bytes, meta: bytes) -> None:
         if self.tar is None or self.sample_in_shard >= self.samples_per_shard:
             self._open_next_shard()
 
         assert self.tar is not None
         prefix = str(sample_id)
-        self._add_bytes(f"{prefix}.image.jpg", encode_jpeg(image))
-        self._add_bytes(f"{prefix}.action.npy", encode_npy(action))
-        self._add_bytes(f"{prefix}.meta.json", json.dumps(meta).encode("utf-8"))
+        self._add_bytes(f"{prefix}.image.jpg", image)
+        self._add_bytes(f"{prefix}.action.npy", action)
+        self._add_bytes(f"{prefix}.meta.json", meta)
         self.sample_in_shard += 1
 
     def _add_bytes(self, name: str, payload: bytes) -> None:
@@ -128,6 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-shard", type=int, default=10000)
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -202,8 +228,18 @@ def load_episode_streams(episode_dir: Path, arm_mode: str) -> EpisodeStreams:
     )
 
 
-def nearest_file(files: list[TimedFile], timestamp: float, max_delta: float) -> TimedFile | None:
-    timestamps = [item.timestamp for item in files]
+def stream_timestamps(files: list[TimedFile]) -> np.ndarray:
+    return np.asarray([item.timestamp for item in files], dtype=np.float64)
+
+
+def nearest_file(
+    files: list[TimedFile],
+    timestamp: float,
+    max_delta: float,
+    timestamps: np.ndarray | None = None,
+) -> TimedFile | None:
+    if timestamps is None:
+        timestamps = stream_timestamps(files)
     idx = int(np.searchsorted(timestamps, timestamp))
     candidates = []
     if idx < len(files):
@@ -227,10 +263,17 @@ def match_side(
     pose_stream: list[TimedFile],
     gripper_stream: list[TimedFile],
     max_delta: float,
+    camera_timestamps: np.ndarray | None = None,
+    pose_timestamps: np.ndarray | None = None,
+    gripper_timestamps: np.ndarray | None = None,
 ) -> MatchedFrame | None:
-    camera = camera_file if camera_file is not None else nearest_file(camera_stream, timestamp, max_delta)
-    pose = nearest_file(pose_stream, timestamp, max_delta)
-    gripper = nearest_file(gripper_stream, timestamp, max_delta)
+    camera = (
+        camera_file
+        if camera_file is not None
+        else nearest_file(camera_stream, timestamp, max_delta, camera_timestamps)
+    )
+    pose = nearest_file(pose_stream, timestamp, max_delta, pose_timestamps)
+    gripper = nearest_file(gripper_stream, timestamp, max_delta, gripper_timestamps)
     if camera is None or pose is None or gripper is None:
         return None
     return MatchedFrame(camera.path, pose.path, gripper.path)
@@ -338,6 +381,93 @@ def build_action(
     return np.concatenate((right_action, left_action), axis=1).astype(np.float32, copy=False)
 
 
+def cached_pose_matrix(path: Path, cache: dict[Path, np.ndarray]) -> np.ndarray:
+    pose = cache.get(path)
+    if pose is None:
+        pose = load_pose_matrix(path)
+        cache[path] = pose
+    return pose
+
+
+def cached_gripper_width(
+    path: Path,
+    cache: dict[Path, np.float32],
+    *,
+    input_max: float,
+    output_max: float,
+) -> np.float32:
+    width = cache.get(path)
+    if width is None:
+        width = load_gripper_width(path, input_max=input_max, output_max=output_max)
+        cache[path] = width
+    return width
+
+
+def build_robot_action_cached(
+    base: MatchedFrame,
+    future_frames: list[MatchedFrame],
+    *,
+    pose_cache: dict[Path, np.ndarray],
+    gripper_cache: dict[Path, np.float32],
+    gripper_input_max: float,
+    gripper_output_max: float,
+) -> np.ndarray:
+    base_pose = cached_pose_matrix(base.pose, pose_cache)
+    actions = []
+    for frame in future_frames:
+        future_pose = cached_pose_matrix(frame.pose, pose_cache)
+        relative_pose = convert_pose_mat_rep(
+            future_pose[None],
+            base_pose_mat=base_pose,
+            pose_rep="relative",
+            backward=False,
+        )[0]
+        gripper = np.asarray(
+            [
+                cached_gripper_width(
+                    frame.gripper,
+                    gripper_cache,
+                    input_max=gripper_input_max,
+                    output_max=gripper_output_max,
+                )
+            ],
+            dtype=np.float32,
+        )
+        pose10d = mat_to_pose10d(relative_pose).astype(np.float32, copy=False)
+        actions.append(np.concatenate((pose10d, gripper), axis=0))
+    return np.stack(actions, axis=0).astype(np.float32, copy=False)
+
+
+def build_action_cached(
+    right_base: MatchedFrame,
+    left_base: MatchedFrame,
+    right_future: list[MatchedFrame],
+    left_future: list[MatchedFrame],
+    *,
+    pose_cache: dict[Path, np.ndarray],
+    gripper_cache: dict[Path, np.float32],
+    gripper_input_max: float,
+    gripper_output_max: float,
+) -> np.ndarray:
+    right_action = build_robot_action_cached(
+        right_base,
+        right_future,
+        pose_cache=pose_cache,
+        gripper_cache=gripper_cache,
+        gripper_input_max=gripper_input_max,
+        gripper_output_max=gripper_output_max,
+    )
+    left_action = build_robot_action_cached(
+        left_base,
+        left_future,
+        pose_cache=pose_cache,
+        gripper_cache=gripper_cache,
+        gripper_input_max=gripper_input_max,
+        gripper_output_max=gripper_output_max,
+    )
+    return np.concatenate((right_action, left_action), axis=1).astype(np.float32, copy=False)
+
+
 def preprocess_single_image(path: Path) -> Image.Image:
     image = Image.open(path).convert("RGB")
     width, height = image.size
@@ -400,12 +530,168 @@ def write_dataset_config(output_root: Path, dataset_name: str, normalizer_path: 
     return config_path
 
 
+def episode_key_for(input_root: Path, episode_dir: Path, single_input_root: bool) -> str:
+    if single_input_root:
+        return episode_dir.name
+    return f"{input_root.name}/{episode_dir.name}"
+
+
+def build_episode_matches(
+    streams: EpisodeStreams,
+    max_delta: float,
+) -> tuple[list[MatchedFrame | None], list[MatchedFrame | None]]:
+    left_camera_timestamps = stream_timestamps(streams.left_camera)
+    right_pose_timestamps = stream_timestamps(streams.right_pose)
+    left_pose_timestamps = stream_timestamps(streams.left_pose)
+    right_gripper_timestamps = stream_timestamps(streams.right_gripper)
+    left_gripper_timestamps = stream_timestamps(streams.left_gripper)
+
+    right_matches: list[MatchedFrame | None] = []
+    left_matches: list[MatchedFrame | None] = []
+    for right_camera in streams.right_camera:
+        timestamp = right_camera.timestamp
+        right_matches.append(
+            match_side(
+                timestamp=timestamp,
+                camera_file=right_camera,
+                camera_stream=streams.right_camera,
+                pose_stream=streams.right_pose,
+                gripper_stream=streams.right_gripper,
+                max_delta=max_delta,
+                pose_timestamps=right_pose_timestamps,
+                gripper_timestamps=right_gripper_timestamps,
+            )
+        )
+        left_matches.append(
+            match_side(
+                timestamp=timestamp,
+                camera_file=None,
+                camera_stream=streams.left_camera,
+                pose_stream=streams.left_pose,
+                gripper_stream=streams.left_gripper,
+                max_delta=max_delta,
+                camera_timestamps=left_camera_timestamps,
+                pose_timestamps=left_pose_timestamps,
+                gripper_timestamps=left_gripper_timestamps,
+            )
+        )
+    return right_matches, left_matches
+
+
+def convert_episode(
+    input_root: Path,
+    episode_dir: Path,
+    *,
+    single_input_root: bool,
+    arm_mode: str,
+    horizon: int,
+    max_sync_delta_sec: float,
+    gripper_input_max: float,
+    gripper_output_max: float,
+    meta: dict[str, Any],
+) -> EpisodeResult:
+    streams = load_episode_streams(episode_dir, arm_mode)
+    episode_key = episode_key_for(input_root, episode_dir, single_input_root)
+    last_start = len(streams.right_camera) - horizon
+    if last_start <= 0:
+        return EpisodeResult(
+            episode_key=episode_key,
+            samples=[],
+            skipped_sync=0,
+            skipped_sync_before_sample=[0],
+            skipped_horizon=len(streams.right_camera),
+        )
+
+    right_matches, left_matches = build_episode_matches(streams, max_sync_delta_sec)
+    pose_cache: dict[Path, np.ndarray] = {}
+    gripper_cache: dict[Path, np.float32] = {}
+    samples: list[EncodedSample] = []
+    skipped_sync = 0
+    skipped_sync_before_sample = [0]
+    meta_bytes = json.dumps(meta).encode("utf-8")
+
+    for start_idx in range(last_start):
+        right_base = right_matches[start_idx]
+        left_base = left_matches[start_idx]
+        if right_base is None or left_base is None:
+            skipped_sync += 1
+            continue
+
+        right_future_raw = right_matches[start_idx + 1 : start_idx + horizon + 1]
+        left_future_raw = left_matches[start_idx + 1 : start_idx + horizon + 1]
+        if any(frame is None for frame in right_future_raw) or any(frame is None for frame in left_future_raw):
+            skipped_sync += 1
+            continue
+        right_future = cast(list[MatchedFrame], right_future_raw)
+        left_future = cast(list[MatchedFrame], left_future_raw)
+
+        image = build_binocular_image(left_base.image, right_base.image)
+        action = build_action_cached(
+            right_base=right_base,
+            left_base=left_base,
+            right_future=right_future,
+            left_future=left_future,
+            pose_cache=pose_cache,
+            gripper_cache=gripper_cache,
+            gripper_input_max=gripper_input_max,
+            gripper_output_max=gripper_output_max,
+        )
+        samples.append(
+            EncodedSample(image=encode_jpeg(image), action=encode_npy(action), meta=meta_bytes)
+        )
+        skipped_sync_before_sample.append(skipped_sync)
+
+    return EpisodeResult(
+        episode_key=episode_key,
+        samples=samples,
+        skipped_sync=skipped_sync,
+        skipped_sync_before_sample=skipped_sync_before_sample,
+        skipped_horizon=0,
+    )
+
+
+def iter_episode_tasks(input_roots: list[Path], max_episodes: int | None) -> list[tuple[Path, Path]]:
+    tasks: list[tuple[Path, Path]] = []
+    for input_root in input_roots:
+        episodes = discover_episode_dirs(input_root)
+        if max_episodes is not None:
+            episodes = episodes[:max_episodes]
+        tasks.extend((input_root, episode_dir) for episode_dir in episodes)
+    return tasks
+
+
+def write_episode_result(
+    writer: ShardWriter,
+    result: EpisodeResult,
+    *,
+    sample_id: int,
+    max_samples: int | None,
+) -> tuple[int, int, int]:
+    if max_samples is None:
+        write_count = len(result.samples)
+    else:
+        write_count = min(len(result.samples), max_samples - sample_id)
+
+    for sample in result.samples[:write_count]:
+        writer.write_encoded_sample(sample_id, image=sample.image, action=sample.action, meta=sample.meta)
+        sample_id += 1
+
+    skipped_sync = result.skipped_sync_before_sample[write_count]
+    if write_count == len(result.samples):
+        skipped_sync = result.skipped_sync
+    return sample_id, write_count, skipped_sync
+
+
 def convert(args: argparse.Namespace) -> dict[str, Any]:
     input_roots = args.input_root
     if isinstance(input_roots, Path):
         input_roots = [input_roots]
+    if args.num_workers < 0:
+        raise ValueError(f"num_workers must be non-negative, got {args.num_workers}")
+
+    single_input_root = len(input_roots) == 1
     dataset_name = args.output_root.name
-    instruction_key = args.instruction_key or f"{args.output_root.name}/{DEFAULT_INSTRUCTION_KEY.split('/', 1)[1]}"
+    instruction_key = args.instruction_key or DEFAULT_INSTRUCTION_KEY
 
     prepare_output_root(args.output_root, args.overwrite)
     write_json(args.output_root / "instructions.json", {instruction_key: args.instruction})
@@ -416,108 +702,70 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
     skipped_horizon = 0
     converted_by_episode: dict[str, int] = {}
     meta = {"sub_task_instruction_key": instruction_key}
+    tasks = iter_episode_tasks(input_roots, args.max_episodes)
+
+    def handle_result(writer: ShardWriter, result: EpisodeResult) -> bool:
+        nonlocal sample_id, skipped_sync, skipped_horizon
+        sample_id, episode_samples, episode_skipped_sync = write_episode_result(
+            writer,
+            result,
+            sample_id=sample_id,
+            max_samples=args.max_samples,
+        )
+        skipped_sync += episode_skipped_sync
+        skipped_horizon += result.skipped_horizon
+        converted_by_episode[result.episode_key] = episode_samples
+        logging.info("Converted %s samples from %s", episode_samples, result.episode_key)
+        return args.max_samples is not None and sample_id >= args.max_samples
 
     with ShardWriter(args.output_root, args.samples_per_shard) as writer:
-        for input_root in input_roots:
-            episodes = discover_episode_dirs(input_root)
-            if args.max_episodes is not None:
-                episodes = episodes[: args.max_episodes]
-
-            for episode_dir in episodes:
-                streams = load_episode_streams(episode_dir, args.arm_mode)
-                episode_samples = 0
-                episode_key = f"{input_root.name}/{episode_dir.name}"
-                last_start = len(streams.right_camera) - args.horizon
-                if last_start <= 0:
-                    skipped_horizon += len(streams.right_camera)
-                    converted_by_episode[episode_key] = 0
-                    continue
-
-                for start_idx in range(last_start):
-                    if args.max_samples is not None and sample_id >= args.max_samples:
-                        break
-
-                    right_camera = streams.right_camera[start_idx]
-                    timestamp = right_camera.timestamp
-                    right_base = match_side(
-                        timestamp=timestamp,
-                        camera_file=right_camera,
-                        camera_stream=streams.right_camera,
-                        pose_stream=streams.right_pose,
-                        gripper_stream=streams.right_gripper,
-                        max_delta=args.max_sync_delta_sec,
-                    )
-                    left_base = match_side(
-                        timestamp=timestamp,
-                        camera_file=None,
-                        camera_stream=streams.left_camera,
-                        pose_stream=streams.left_pose,
-                        gripper_stream=streams.left_gripper,
-                        max_delta=args.max_sync_delta_sec,
-                    )
-                    if right_base is None or left_base is None:
-                        skipped_sync += 1
-                        continue
-
-                    right_future: list[MatchedFrame] = []
-                    left_future: list[MatchedFrame] = []
-                    for offset in range(1, args.horizon + 1):
-                        right_camera = streams.right_camera[start_idx + offset]
-                        timestamp = right_camera.timestamp
-                        right_frame = match_side(
-                            timestamp=timestamp,
-                            camera_file=right_camera,
-                            camera_stream=streams.right_camera,
-                            pose_stream=streams.right_pose,
-                            gripper_stream=streams.right_gripper,
-                            max_delta=args.max_sync_delta_sec,
-                        )
-                        left_frame = match_side(
-                            timestamp=timestamp,
-                            camera_file=None,
-                            camera_stream=streams.left_camera,
-                            pose_stream=streams.left_pose,
-                            gripper_stream=streams.left_gripper,
-                            max_delta=args.max_sync_delta_sec,
-                        )
-                        if right_frame is None or left_frame is None:
-                            break
-                        right_future.append(right_frame)
-                        left_future.append(left_frame)
-
-                    if len(right_future) != args.horizon or len(left_future) != args.horizon:
-                        skipped_sync += 1
-                        continue
-
-                    image = build_binocular_image(left_base.image, right_base.image)
-                    action = build_action(
-                        right_base=right_base,
-                        left_base=left_base,
-                        right_future=right_future,
-                        left_future=left_future,
+        if args.num_workers <= 1:
+            for input_root, episode_dir in tasks:
+                result = convert_episode(
+                    input_root,
+                    episode_dir,
+                    single_input_root=single_input_root,
+                    arm_mode=args.arm_mode,
+                    horizon=args.horizon,
+                    max_sync_delta_sec=args.max_sync_delta_sec,
+                    gripper_input_max=args.gripper_input_max,
+                    gripper_output_max=args.gripper_output_max,
+                    meta=meta,
+                )
+                if handle_result(writer, result):
+                    break
+        else:
+            with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+                futures = [
+                    executor.submit(
+                        convert_episode,
+                        input_root,
+                        episode_dir,
+                        single_input_root=single_input_root,
+                        arm_mode=args.arm_mode,
+                        horizon=args.horizon,
+                        max_sync_delta_sec=args.max_sync_delta_sec,
                         gripper_input_max=args.gripper_input_max,
                         gripper_output_max=args.gripper_output_max,
+                        meta=meta,
                     )
-                    writer.write_sample(sample_id, image=image, action=action, meta=meta)
-                    sample_id += 1
-                    episode_samples += 1
-
-                converted_by_episode[episode_key] = episode_samples
-                logging.info("Converted %s samples from %s", episode_samples, episode_dir)
-                if args.max_samples is not None and sample_id >= args.max_samples:
-                    break
-
-            if args.max_samples is not None and sample_id >= args.max_samples:
-                break
+                    for input_root, episode_dir in tasks
+                ]
+                for idx, future in enumerate(futures):
+                    result = future.result()
+                    futures[idx] = None  # type: ignore[list-item]
+                    if handle_result(writer, result):
+                        for remaining in futures[idx + 1 :]:
+                            if remaining is not None:
+                                remaining.cancel()
+                        break
 
     manifest = {
-        "input_roots": [str(input_root) for input_root in input_roots],
         "output_root": str(args.output_root),
         "dataset_config": str(config_path),
         "dataset_name": dataset_name,
         "instruction_key": instruction_key,
         "instruction": args.instruction,
-        "arm_mode": args.arm_mode,
         "fps": args.fps,
         "horizon": args.horizon,
         "max_sync_delta_sec": args.max_sync_delta_sec,
@@ -529,6 +777,10 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         "skipped_horizon_frames": skipped_horizon,
         "converted_by_episode": converted_by_episode,
     }
+    if single_input_root:
+        manifest = {"input_root": str(input_roots[0]), **manifest}
+    else:
+        manifest = {"input_roots": [str(input_root) for input_root in input_roots], **manifest}
     write_json(args.output_root / "conversion_manifest.json", manifest)
     return manifest
 
