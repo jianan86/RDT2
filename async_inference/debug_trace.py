@@ -149,6 +149,159 @@ class StopDetector:
         return events
 
 
+class CommandExecutionConflictDetector:
+    def __init__(
+        self,
+        window_seconds: float = 0.7,
+        command_pos_threshold: float = 0.01,
+        command_rot_threshold: float = 0.05,
+        target_pos_threshold: float = 0.01,
+        target_rot_threshold: float = 0.05,
+        actual_pos_threshold: float = 0.002,
+        actual_rot_threshold: float = 0.01,
+        lag_pos_threshold: float = 0.02,
+        lag_rot_threshold: float = 0.10,
+        emit_cooldown_seconds: float = 1.0,
+    ):
+        self.window_seconds = float(window_seconds)
+        self.command_pos_threshold = float(command_pos_threshold)
+        self.command_rot_threshold = float(command_rot_threshold)
+        self.target_pos_threshold = float(target_pos_threshold)
+        self.target_rot_threshold = float(target_rot_threshold)
+        self.actual_pos_threshold = float(actual_pos_threshold)
+        self.actual_rot_threshold = float(actual_rot_threshold)
+        self.lag_pos_threshold = float(lag_pos_threshold)
+        self.lag_rot_threshold = float(lag_rot_threshold)
+        self.emit_cooldown_seconds = float(emit_cooldown_seconds)
+        self._samples: deque[tuple[float, np.ndarray, np.ndarray, np.ndarray, dict[int, dict[str, Any]]]] = deque()
+        self._last_emit: dict[tuple[int, str], float] = {}
+
+    def update(
+        self,
+        timestamp: float,
+        model_action: np.ndarray,
+        target: np.ndarray,
+        actual: np.ndarray,
+        arm_slices: Iterable[slice],
+        step_diagnoses: dict[int, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        model_action = np.asarray(model_action, dtype=np.float32)
+        target = np.asarray(target, dtype=np.float32)
+        actual = np.asarray(actual, dtype=np.float32)
+        step_diagnoses = step_diagnoses or {}
+        self._samples.append((float(timestamp), model_action.copy(), target.copy(), actual.copy(), dict(step_diagnoses)))
+        while self._samples and timestamp - self._samples[0][0] > self.window_seconds:
+            self._samples.popleft()
+        if len(self._samples) < 2:
+            return []
+
+        start_t, start_action, start_target, start_actual, _ = self._samples[0]
+        events = []
+        for arm_idx, arm_slice in enumerate(arm_slices):
+            action0 = start_action[arm_slice]
+            action1 = model_action[arm_slice]
+            target0 = start_target[arm_slice]
+            target1 = target[arm_slice]
+            actual0 = start_actual[arm_slice]
+            actual1 = actual[arm_slice]
+            command_pos = float(np.linalg.norm(action1[:3] - action0[:3]))
+            command_rot = float(np.linalg.norm(action1[3:6] - action0[3:6]))
+            command_error_pos = float(np.linalg.norm(action1[:3] - actual1[:3]))
+            command_error_rot = float(np.linalg.norm(action1[3:6] - actual1[3:6]))
+            target_pos = float(np.linalg.norm(target1[:3] - target0[:3]))
+            target_rot = float(np.linalg.norm(target1[3:6] - target0[3:6]))
+            actual_pos = float(np.linalg.norm(actual1[:3] - actual0[:3]))
+            actual_rot = float(np.linalg.norm(actual1[3:6] - actual0[3:6]))
+            target_error_pos = float(np.linalg.norm(target1[:3] - actual1[:3]))
+            target_error_rot = float(np.linalg.norm(target1[3:6] - actual1[3:6]))
+            model_commands_motion = (
+                command_pos >= self.command_pos_threshold
+                or command_rot >= self.command_rot_threshold
+                or command_error_pos >= self.command_pos_threshold
+                or command_error_rot >= self.command_rot_threshold
+            )
+            target_moving = target_pos >= self.target_pos_threshold or target_rot >= self.target_rot_threshold
+            actual_static = actual_pos <= self.actual_pos_threshold and actual_rot <= self.actual_rot_threshold
+            lagging = target_error_pos >= self.lag_pos_threshold or target_error_rot >= self.lag_rot_threshold
+            oscillating = self._action_oscillates(arm_idx, arm_slice)
+            step_diag = step_diagnoses.get(arm_idx, {})
+            limited = bool(step_diag.get("evidence"))
+
+            reason = "none"
+            evidence = []
+            if model_commands_motion:
+                evidence.append("model_commands_motion")
+            if target_moving:
+                evidence.append("target_moving")
+            if actual_static:
+                evidence.append("actual_static")
+            if limited:
+                evidence.extend(str(item) for item in step_diag.get("evidence", []))
+            if lagging:
+                evidence.append("target_actual_error_high")
+            if oscillating:
+                evidence.append("model_command_oscillation")
+
+            if model_commands_motion and target_moving and actual_static:
+                reason = "execution_stalled"
+            elif model_commands_motion and lagging:
+                reason = "execution_lagging"
+            elif oscillating:
+                reason = "model_command_oscillation"
+            elif limited:
+                reason = "too_fast"
+
+            if reason == "none":
+                continue
+            key = (arm_idx, reason)
+            last_emit = self._last_emit.get(key, -math.inf)
+            if timestamp - last_emit < self.emit_cooldown_seconds:
+                continue
+            self._last_emit[key] = timestamp
+            events.append({
+                "arm": arm_idx,
+                "reason": reason,
+                "window_seconds": timestamp - start_t,
+                "evidence": sorted(set(evidence)),
+                "commanded_pos_delta": command_pos,
+                "commanded_rot_delta": command_rot,
+                "command_actual_pos_error": command_error_pos,
+                "command_actual_rot_error": command_error_rot,
+                "target_pos_delta": target_pos,
+                "target_rot_delta": target_rot,
+                "actual_pos_delta": actual_pos,
+                "actual_rot_delta": actual_rot,
+                "target_actual_pos_error": target_error_pos,
+                "target_actual_rot_error": target_error_rot,
+                "diagnosis": {
+                    "reason": reason,
+                    "severity": "warning",
+                    "errors": [],
+                    "warnings": [],
+                    "evidence": sorted(set(evidence)),
+                },
+            })
+        return events
+
+    def _action_oscillates(self, arm_idx: int, arm_slice: slice) -> bool:
+        if len(self._samples) < 4:
+            return False
+        steps = []
+        for idx in range(1, len(self._samples)):
+            prev_action = self._samples[idx - 1][1][arm_slice]
+            curr_action = self._samples[idx][1][arm_slice]
+            delta = curr_action[:3] - prev_action[:3]
+            if float(np.linalg.norm(delta)) >= self.command_pos_threshold * 0.5:
+                steps.append(delta)
+        if len(steps) < 2:
+            return False
+        flips = 0
+        for prev, curr in zip(steps, steps[1:], strict=False):
+            if float(np.dot(prev, curr)) < 0.0:
+                flips += 1
+        return flips >= 1
+
+
 def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
     if robot is None:
         return {}
@@ -189,9 +342,12 @@ def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
 PIPER_REASON_PRIORITY = {
     "none": 0,
     "other": 1,
-    "ik_failed": 2,
-    "too_fast": 3,
-    "out_of_range": 4,
+    "model_command_oscillation": 2,
+    "execution_lagging": 3,
+    "execution_stalled": 4,
+    "too_fast": 5,
+    "ik_failed": 6,
+    "out_of_range": 7,
 }
 
 PIPER_ERROR_REASON_TERMS = {

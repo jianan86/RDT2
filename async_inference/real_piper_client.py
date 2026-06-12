@@ -17,6 +17,7 @@ import numpy as np
 import yaml
 from async_inference.codec import encode_jpeg, save_rgb_png, unflatten_action
 from async_inference.debug_trace import (
+    CommandExecutionConflictDetector,
     JsonlTraceWriter,
     StopDetector,
     collect_sdk_snapshot,
@@ -383,6 +384,31 @@ class BimanualHardware:
         return diagnoses
 
 
+
+
+
+class ActionItem:
+    timestep: int
+    action: np.ndarray
+    metadata: dict
+
+    def __init__(self, timestep: int, action: np.ndarray, metadata: dict):
+        self.timestep = timestep
+        self.action = action
+        self.metadata = metadata
+
+    def __iter__(self):
+        yield self.timestep
+        yield self.action
+
+    def __getitem__(self, index: int):
+        if index == 0:
+            return self.timestep
+        if index == 1:
+            return self.action
+        raise IndexError(index)
+
+
 class ActionQueue:
     PREFIX_NO_MERGE = "prefix_no_merge"
     BLEND_OVERLAP = "blend_overlap"
@@ -401,7 +427,7 @@ class ActionQueue:
         if chunk_merge_strategy == self.PREFIX_NO_MERGE and chunk_execute_prefix_steps <= 0:
             raise ValueError("chunk_execute_prefix_steps must be positive for prefix_no_merge")
         self._lock = threading.Lock()
-        self._actions: list[tuple[int, np.ndarray]] = []
+        self._actions: list[ActionItem] = []
         self.chunk_merge_strategy = chunk_merge_strategy
         self.chunk_execute_prefix_steps = int(chunk_execute_prefix_steps)
         self.action_chunk_size = 0
@@ -411,12 +437,19 @@ class ActionQueue:
         chunk_latest_action: int,
         action: np.ndarray,
         current_latest_action: Optional[int] = None,
+        request_id: Optional[int] = None,
     ) -> None:
         action = np.asarray(action, dtype=np.float32)
         if current_latest_action is None:
             current_latest_action = chunk_latest_action
         base_timestep = int(chunk_latest_action) + 1
-        incoming = self._future_actions(base_timestep, action, int(current_latest_action))
+        incoming = self._future_actions(
+            base_timestep,
+            action,
+            int(current_latest_action),
+            request_id=request_id,
+            chunk_latest_action=chunk_latest_action,
+        )
 
         with self._lock:
             self.action_chunk_size = max(self.action_chunk_size, int(action.shape[0]))
@@ -429,7 +462,7 @@ class ActionQueue:
 
     def pop_next(self, latest_action: int) -> Optional[tuple[int, np.ndarray]]:
         with self._lock:
-            while self._actions and self._actions[0][0] <= latest_action:
+            while self._actions and self._actions[0].timestep <= latest_action:
                 self._actions.pop(0)
             if not self._actions:
                 return None
@@ -448,46 +481,69 @@ class ActionQueue:
         base_timestep: int,
         action: np.ndarray,
         latest_action: int,
-    ) -> list[tuple[int, np.ndarray]]:
+        *,
+        request_id: Optional[int],
+        chunk_latest_action: int,
+    ) -> list[ActionItem]:
+        first_step = base_timestep
+        last_step = base_timestep + int(action.shape[0]) - 1
         return [
-            (base_timestep + idx, row.copy())
+            ActionItem(
+                timestep=base_timestep + idx,
+                action=row.copy(),
+                metadata={
+                    "request_id": request_id,
+                    "chunk_latest_action": int(chunk_latest_action),
+                    "action_index": idx,
+                    "first_step": first_step,
+                    "last_step": last_step,
+                    "merged": False,
+                },
+            )
             for idx, row in enumerate(action)
             if base_timestep + idx > latest_action
         ]
 
     def _merge_with_existing(
         self,
-        incoming: list[tuple[int, np.ndarray]],
+        incoming: list[ActionItem],
         latest_action: int,
-    ) -> list[tuple[int, np.ndarray]]:
-        old_live = [(ts, act) for ts, act in self._actions if ts > latest_action]
+    ) -> list[ActionItem]:
+        old_live = [item for item in self._actions if item.timestep > latest_action]
         if not incoming:
             return old_live
         if not old_live:
             return incoming
 
-        old_by_timestep = {ts: act for ts, act in old_live}
-        incoming_by_timestep = {ts: act for ts, act in incoming}
-        incoming_first = incoming[0][0]
-        overlap_timesteps = [ts for ts, _ in incoming if ts in old_by_timestep]
+        old_by_timestep = {item.timestep: item for item in old_live}
+        incoming_by_timestep = {item.timestep: item for item in incoming}
+        incoming_first = incoming[0].timestep
+        overlap_timesteps = [item.timestep for item in incoming if item.timestep in old_by_timestep]
         overlap_count = max(1, len(overlap_timesteps))
         overlap_index = 0
-        output: dict[int, np.ndarray] = {}
+        output: dict[int, ActionItem] = {}
 
-        for ts, act in old_live:
-            if ts < incoming_first and ts not in incoming_by_timestep:
-                output[ts] = act
+        for item in old_live:
+            if item.timestep < incoming_first and item.timestep not in incoming_by_timestep:
+                output[item.timestep] = item
 
-        for ts, act in incoming:
-            old = old_by_timestep.get(ts)
+        for item in incoming:
+            old = old_by_timestep.get(item.timestep)
             if old is None:
-                output[ts] = act
+                output[item.timestep] = item
                 continue
             alpha = float(overlap_index + 1) / float(overlap_count + 1)
-            output[ts] = blend_pose14(old, act, alpha)
+            metadata = dict(item.metadata)
+            metadata["merged"] = True
+            metadata["sources"] = [old.metadata, item.metadata]
+            output[item.timestep] = ActionItem(
+                timestep=item.timestep,
+                action=blend_pose14(old.action, item.action, alpha),
+                metadata=metadata,
+            )
             overlap_index += 1
 
-        return [(ts, output[ts]) for ts in sorted(output)]
+        return [output[ts] for ts in sorted(output)]
 
 
 class ActionStreamWorker:
@@ -535,7 +591,7 @@ class ActionStreamWorker:
                 action = adapt_action_for_arm_mode(action, self.arm_mode)
                 action_summary = summarize_action(action, pose_slices=(RIGHT_ARM_SLICE, LEFT_ARM_SLICE))
                 current_latest_action = self.latest_action.get()
-                self.action_queue.add_chunk(chunk.latest_action, action, current_latest_action)
+                self.action_queue.add_chunk(chunk.latest_action, action, current_latest_action, request_id=chunk.request_id)
                 self.request_in_flight.set(-1)
                 self.must_go.set(True)
                 first_step = chunk.latest_action + 1
@@ -807,6 +863,17 @@ def control_loop(
         actual_pos_threshold=args.stop_actual_pos_threshold,
         actual_rot_threshold=args.stop_actual_rot_threshold,
     )
+    conflict_detector = CommandExecutionConflictDetector(
+        window_seconds=args.stop_detector_window,
+        command_pos_threshold=args.stop_target_pos_threshold,
+        command_rot_threshold=args.stop_target_rot_threshold,
+        target_pos_threshold=args.stop_target_pos_threshold,
+        target_rot_threshold=args.stop_target_rot_threshold,
+        actual_pos_threshold=args.stop_actual_pos_threshold,
+        actual_rot_threshold=args.stop_actual_rot_threshold,
+        lag_pos_threshold=max(args.stop_target_pos_threshold, args.stop_actual_pos_threshold * 5.0),
+        lag_rot_threshold=max(args.stop_target_rot_threshold, args.stop_actual_rot_threshold * 5.0),
+    )
     arm_slices = (RIGHT_ARM_SLICE, LEFT_ARM_SLICE)
     deadline = None if args.run_seconds <= 0 else time.time() + args.run_seconds
     while not stop_event.is_set():
@@ -817,6 +884,7 @@ def control_loop(
         item = action_queue.pop_next(latest_action.get())
         if item is not None:
             timestep, action = item
+            action_source = getattr(item, "metadata", {})
             target = last_target.copy()
             target[RIGHT_ARM_SLICE] = limit_step(last_target[RIGHT_ARM_SLICE], action[RIGHT_ARM_SLICE], args)
             target[LEFT_ARM_SLICE] = limit_step(last_target[LEFT_ARM_SLICE], action[LEFT_ARM_SLICE], args)
@@ -852,6 +920,21 @@ def control_loop(
             target_delta = target - last_target
             actual_error = target - actual
             sdk_diagnoses = hardware.get_arm_status_diagnoses()
+            command_execution_conflicts = conflict_detector.update(
+                time.time(),
+                action,
+                target,
+                actual,
+                arm_slices,
+                step_diagnoses,
+            )
+            for event in command_execution_conflicts:
+                arm_idx = int(event["arm"])
+                event["diagnosis"] = merge_diagnoses(
+                    sdk_diagnoses.get(arm_idx),
+                    step_diagnoses.get(arm_idx),
+                    event.get("diagnosis"),
+                )
             stop_events = stop_detector.update(time.time(), target, actual, arm_slices)
             for event in stop_events:
                 arm_idx = int(event["arm"])
@@ -865,6 +948,7 @@ def control_loop(
                     "timestep": timestep,
                     "queue_size": len(action_queue),
                     "action": np.asarray(action, dtype=np.float32).round(5).tolist(),
+                    "action_source": action_source,
                     "target": target.round(5).tolist(),
                     "last_target": last_target.round(5).tolist(),
                     "actual": actual.round(5).tolist(),
@@ -873,8 +957,21 @@ def control_loop(
                     "action_summary": action_summary,
                     "step_diagnoses": step_diagnoses,
                     "sdk_diagnoses": sdk_diagnoses,
+                    "command_execution_conflicts": command_execution_conflicts,
                     "stop_events": stop_events,
                 })
+            for event in command_execution_conflicts:
+                diagnosis = event.get("diagnosis", {})
+                print(
+                    f"[command-exec-conflict] arm={event['arm']} timestep={timestep} "
+                    f"reason={diagnosis.get('reason', event.get('reason', 'other'))} "
+                    f"evidence={diagnosis.get('evidence', event.get('evidence', []))} "
+                    f"window={event['window_seconds']:.2f}s "
+                    f"commanded_pos_delta={event['commanded_pos_delta']:.5f} "
+                    f"target_pos_delta={event['target_pos_delta']:.5f} "
+                    f"actual_pos_delta={event['actual_pos_delta']:.5f} "
+                    f"target_actual_pos_error={event['target_actual_pos_error']:.5f}"
+                )
             for event in stop_events:
                 diagnosis = event.get("diagnosis", {})
                 print(

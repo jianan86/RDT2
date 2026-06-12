@@ -8,6 +8,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from async_inference.debug_trace import (
+    CommandExecutionConflictDetector,
     StopDetector,
     collect_sdk_snapshot,
     diagnose_piper_status,
@@ -353,6 +354,80 @@ def test_merge_diagnoses_prefers_out_of_range_over_too_fast():
     assert merged["severity"] == "error"
     assert "pos_step_limited" in merged["evidence"]
     assert "joint_2_angle_limit" in merged["evidence"]
+
+
+def test_command_execution_conflict_fires_when_command_and_target_move_but_actual_static():
+    detector = CommandExecutionConflictDetector(window_seconds=0.5)
+    action0 = np.zeros(14, dtype=np.float32)
+    target0 = np.zeros(14, dtype=np.float32)
+    actual = np.zeros(14, dtype=np.float32)
+    action1 = action0.copy()
+    target1 = target0.copy()
+    action1[0] = 0.03
+    target1[0] = 0.02
+
+    assert detector.update(0.0, action0, target0, actual, (slice(0, 7), slice(7, 14))) == []
+    events = detector.update(0.5, action1, target1, actual, (slice(0, 7), slice(7, 14)))
+
+    assert len(events) == 1
+    assert events[0]["reason"] == "execution_stalled"
+    assert "model_commands_motion" in events[0]["evidence"]
+    assert "actual_static" in events[0]["evidence"]
+
+
+def test_command_execution_conflict_does_not_fire_when_actual_follows():
+    detector = CommandExecutionConflictDetector(window_seconds=0.5)
+    action0 = np.zeros(14, dtype=np.float32)
+    action1 = action0.copy()
+    action1[0] = 0.03
+
+    detector.update(0.0, action0, action0, action0, (slice(0, 7), slice(7, 14)))
+    events = detector.update(0.5, action1, action1, action1, (slice(0, 7), slice(7, 14)))
+
+    assert events == []
+
+
+def test_command_execution_conflict_detects_model_command_oscillation():
+    detector = CommandExecutionConflictDetector(window_seconds=1.0)
+    target = np.zeros(14, dtype=np.float32)
+    actual = np.zeros(14, dtype=np.float32)
+    for idx, value in enumerate([0.0, 0.02, -0.02, 0.02]):
+        action = np.zeros(14, dtype=np.float32)
+        action[0] = value
+        events = detector.update(float(idx) * 0.2, action, target, actual, (slice(0, 7), slice(7, 14)))
+
+    assert events
+    assert events[-1]["reason"] == "model_command_oscillation"
+
+
+def test_action_queue_pop_exposes_action_source_metadata():
+    action = np.zeros((2, 14), dtype=np.float32)
+    queue = ActionQueue()
+    queue.add_chunk(chunk_latest_action=4, action=action, current_latest_action=4, request_id=17)
+
+    item = queue.pop_next(latest_action=4)
+
+    assert item is not None
+    timestep, popped = item
+    assert timestep == 5
+    np.testing.assert_allclose(popped, action[0])
+    assert item.metadata["request_id"] == 17
+    assert item.metadata["chunk_latest_action"] == 4
+    assert item.metadata["action_index"] == 0
+
+
+def test_action_queue_overlap_marks_merged_metadata():
+    old = np.zeros((2, 14), dtype=np.float32)
+    new = np.ones((2, 14), dtype=np.float32)
+    queue = ActionQueue(chunk_merge_strategy=ActionQueue.BLEND_OVERLAP)
+    queue.add_chunk(chunk_latest_action=9, action=old, current_latest_action=9, request_id=1)
+    queue.add_chunk(chunk_latest_action=9, action=new, current_latest_action=9, request_id=2)
+
+    item = queue.pop_next(latest_action=9)
+
+    assert item is not None
+    assert item.metadata["merged"]
+    assert len(item.metadata["sources"]) == 2
 
 
 def test_action_chunk_carries_latest_action_only():
