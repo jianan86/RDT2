@@ -28,6 +28,7 @@ pillow
 scikit-image
 scikit-learn
 scipy
+pin==2.7.0
 threadpoolctl
 tqdm
 safetensors
