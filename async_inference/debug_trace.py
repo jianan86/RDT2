@@ -162,8 +162,12 @@ def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
         "GetArmEndPoseMsgs",
         "GetArmJointMsgs",
         "GetArmGripperMsgs",
+        "GetArmHighSpdInfoMsgs",
         "GetArmLowSpdInfoMsgs",
+        "GetCurrentEndVelAndAccParam",
+        "GetCurrentMotorAngleLimitMaxVel",
         "GetPiperFirmwareVersion",
+        "GetCanFps",
     )
     snapshot = {}
     for name in names:
@@ -182,12 +186,53 @@ def collect_sdk_snapshot(robot: Any) -> dict[str, Any]:
     return snapshot
 
 
-PIPER_FATAL_STATUS_TERMS = (
-    "TARGET_POS_EXCEEDS_LIMIT",
+PIPER_REASON_PRIORITY = {
+    "none": 0,
+    "other": 1,
+    "ik_failed": 2,
+    "too_fast": 3,
+    "out_of_range": 4,
+}
+
+PIPER_ERROR_REASON_TERMS = {
+    "NO_SOLUTION": "ik_failed",
+    "SINGULARITY_POINT": "ik_failed",
+    "TARGET_POS_EXCEEDS_LIMIT": "out_of_range",
+    "EMERGENCY_STOP": "other",
+    "JOINT_COMMUNICATION_ERR": "other",
+    "JOINT_BRAKE_NOT_RELEASED": "other",
+    "COLLISION_OCCURRED": "other",
+    "JOINT_STATUS_ERR": "other",
+    "OTHER_ERR": "other",
+    "MAIN_CONTROLLER_NTC_OVER_TEMPERATURE": "other",
+    "RELEASE_RESISTOR_NTC_OVER_TEMPERATURE": "other",
+}
+
+PIPER_WARNING_REASON_TERMS = {
+    "REACH_TARGET_POS_FAILED": "ik_failed",
+    "OVERSPEED_DURING_TEACHING_DRAG": "too_fast",
+}
+
+PIPER_FATAL_STATUS_TERMS = tuple(PIPER_ERROR_REASON_TERMS)
+PIPER_WARNING_STATUS_TERMS = tuple(PIPER_WARNING_REASON_TERMS)
+
+PIPER_JOINT_LIMIT_FIELDS = (
+    "joint_1_angle_limit",
+    "joint_2_angle_limit",
+    "joint_3_angle_limit",
+    "joint_4_angle_limit",
+    "joint_5_angle_limit",
+    "joint_6_angle_limit",
 )
 
-PIPER_WARNING_STATUS_TERMS = (
-    "REACH_TARGET_POS_FAILED",
+PIPER_LOW_SPEED_FAULT_FIELDS = (
+    "voltage_too_low",
+    "motor_overheating",
+    "driver_overcurrent",
+    "driver_overheating",
+    "collision_status",
+    "driver_error_status",
+    "stall_status",
 )
 
 
@@ -199,6 +244,113 @@ def find_piper_status_errors(snapshot: dict[str, Any]) -> list[str]:
 def find_piper_status_warnings(snapshot: dict[str, Any]) -> list[str]:
     text = json.dumps(_jsonable(snapshot), sort_keys=True)
     return [term for term in PIPER_WARNING_STATUS_TERMS if term in text]
+
+
+def diagnose_piper_status(snapshot: dict[str, Any]) -> dict[str, Any]:
+    text = json.dumps(_jsonable(snapshot), sort_keys=True)
+    errors = find_piper_status_errors(snapshot)
+    warnings = find_piper_status_warnings(snapshot)
+    evidence = []
+    reasons = []
+
+    for term in errors:
+        reasons.append(PIPER_ERROR_REASON_TERMS[term])
+        evidence.append(term)
+    for term in warnings:
+        reasons.append(PIPER_WARNING_REASON_TERMS[term])
+        evidence.append(term)
+
+    for field in PIPER_JOINT_LIMIT_FIELDS:
+        if _json_bool_field_is_true(text, field):
+            reasons.append("out_of_range")
+            evidence.append(field)
+
+    for field in PIPER_LOW_SPEED_FAULT_FIELDS:
+        if _json_bool_field_is_true(text, field):
+            reasons.append("other")
+            evidence.append(field)
+
+    reason = _highest_priority_reason(reasons)
+    severity = "error" if errors else "warning" if warnings or evidence else "none"
+    return {
+        "reason": reason,
+        "severity": severity,
+        "errors": errors,
+        "warnings": warnings,
+        "evidence": sorted(set(evidence)),
+    }
+
+
+def diagnose_step_limit(
+    current: np.ndarray,
+    requested: np.ndarray,
+    limited: np.ndarray,
+    *,
+    max_pos_step: float,
+    max_rot_step: float,
+    max_gripper_step: float,
+    atol: float = 1e-6,
+) -> dict[str, Any]:
+    current = np.asarray(current, dtype=np.float32)
+    requested = np.asarray(requested, dtype=np.float32)
+    limited = np.asarray(limited, dtype=np.float32)
+    requested_delta = requested - current
+    limited_delta = limited - current
+    clipped = np.abs(requested_delta - limited_delta) > atol
+    evidence = []
+    if bool(np.any(clipped[:3])):
+        evidence.append("pos_step_limited")
+    if bool(np.any(clipped[3:6])):
+        evidence.append("rot_step_limited")
+    if requested.shape[0] > 6 and (bool(clipped[6]) or abs(float(requested_delta[6])) > max_gripper_step + atol):
+        evidence.append("gripper_step_limited")
+
+    return {
+        "reason": "too_fast" if evidence else "none",
+        "evidence": evidence,
+        "requested_delta": _round_list(requested_delta),
+        "limited_delta": _round_list(limited_delta),
+        "requested_pos_step": _finite_float(np.linalg.norm(requested_delta[:3])),
+        "limited_pos_step": _finite_float(np.linalg.norm(limited_delta[:3])),
+        "requested_rot_step": _finite_float(np.linalg.norm(requested_delta[3:6])),
+        "limited_rot_step": _finite_float(np.linalg.norm(limited_delta[3:6])),
+    }
+
+
+def merge_diagnoses(*diagnoses: dict[str, Any] | None) -> dict[str, Any]:
+    reasons = []
+    evidence = []
+    errors = []
+    warnings = []
+    for diagnosis in diagnoses:
+        if not diagnosis:
+            continue
+        reason = diagnosis.get("reason", "none")
+        if reason and reason != "none":
+            reasons.append(str(reason))
+        evidence.extend(str(item) for item in diagnosis.get("evidence", []))
+        errors.extend(str(item) for item in diagnosis.get("errors", []))
+        warnings.extend(str(item) for item in diagnosis.get("warnings", []))
+    severity = "error" if errors else "warning" if warnings or evidence else "none"
+    return {
+        "reason": _highest_priority_reason(reasons),
+        "severity": severity,
+        "errors": sorted(set(errors)),
+        "warnings": sorted(set(warnings)),
+        "evidence": sorted(set(evidence)),
+    }
+
+
+def _highest_priority_reason(reasons: Iterable[str]) -> str:
+    best = "none"
+    for reason in reasons:
+        if PIPER_REASON_PRIORITY.get(reason, 0) > PIPER_REASON_PRIORITY[best]:
+            best = reason
+    return best
+
+
+def _json_bool_field_is_true(text: str, field: str) -> bool:
+    return f"\"{field}\": true" in text
 
 
 def _round_list(values: np.ndarray, digits: int = 5) -> list[float]:

@@ -20,8 +20,11 @@ from async_inference.debug_trace import (
     JsonlTraceWriter,
     StopDetector,
     collect_sdk_snapshot,
+    diagnose_piper_status,
+    diagnose_step_limit,
     find_piper_status_errors,
     find_piper_status_warnings,
+    merge_diagnoses,
     summarize_action,
 )
 from async_inference.proto import rdt2_async_pb2, rdt2_async_pb2_grpc
@@ -111,6 +114,8 @@ class PiperRobot:
         self.dry_run = dry_run
         self.sdk_trace_writer = sdk_trace_writer
         self.stop_on_piper_status_error = stop_on_piper_status_error
+        self.last_sdk_diagnosis = {"reason": "none", "severity": "none", "errors": [], "warnings": [], "evidence": []}
+        self._last_printed_status_key = None
         self.robot = None
         if no_piper:
             print(f"[piper:{side}] disabled")
@@ -165,10 +170,14 @@ class PiperRobot:
             event["sdk_snapshot"] = sdk_snapshot
             status_errors = find_piper_status_errors(sdk_snapshot)
             status_warnings = find_piper_status_warnings(sdk_snapshot)
+            sdk_diagnosis = diagnose_piper_status(sdk_snapshot)
+            self.last_sdk_diagnosis = sdk_diagnosis
             if status_errors:
                 event["piper_status_errors"] = status_errors
             if status_warnings:
                 event["piper_status_warnings"] = status_warnings
+            event["diagnosis"] = sdk_diagnosis
+            self._maybe_print_sdk_diagnosis(event, sdk_diagnosis)
             if self.sdk_trace_writer is not None:
                 self.sdk_trace_writer.write(event)
             if status_errors and self.stop_on_piper_status_error:
@@ -176,6 +185,36 @@ class PiperRobot:
                     f"Piper {self.side} status error after target {event['target']}: "
                     f"{status_errors}"
                 )
+
+
+    def get_status_diagnosis(self) -> dict:
+        return dict(self.last_sdk_diagnosis)
+
+    def _maybe_print_sdk_diagnosis(self, event: dict, diagnosis: dict) -> None:
+        if diagnosis.get("severity") == "none":
+            self._last_printed_status_key = None
+            return
+        key = (
+            diagnosis.get("severity"),
+            diagnosis.get("reason"),
+            tuple(diagnosis.get("errors", [])),
+            tuple(diagnosis.get("warnings", [])),
+            tuple(diagnosis.get("evidence", [])),
+        )
+        if key == self._last_printed_status_key:
+            return
+        self._last_printed_status_key = key
+        severity = diagnosis.get("severity")
+        reason = diagnosis.get("reason")
+        errors = diagnosis.get("errors")
+        warnings = diagnosis.get("warnings")
+        evidence = diagnosis.get("evidence")
+        target = event.get("target")
+        print(
+            f"[piper-diagnostic] side={self.side} severity={severity} "
+            f"reason={reason} errors={errors} warnings={warnings} "
+            f"evidence={evidence} target={target}"
+        )
 
 
 class PikaGripper:
@@ -333,6 +372,15 @@ class BimanualHardware:
         self.left_arm.execute_pose(ee_target[LEFT_ARM_SLICE])
         self.right_gripper.execute_width(float(tcp_target[RIGHT_ARM_SLICE][6]))
         self.left_gripper.execute_width(float(tcp_target[LEFT_ARM_SLICE][6]))
+
+    def get_arm_status_diagnoses(self) -> dict[int, dict]:
+        diagnoses = {0: self.right_arm.get_status_diagnosis()}
+        if self.arm_mode == "single":
+            diagnoses[1] = diagnoses[0]
+            return diagnoses
+        if self.left_arm is not None:
+            diagnoses[1] = self.left_arm.get_status_diagnosis()
+        return diagnoses
 
 
 class ActionQueue:
@@ -772,6 +820,24 @@ def control_loop(
             target = last_target.copy()
             target[RIGHT_ARM_SLICE] = limit_step(last_target[RIGHT_ARM_SLICE], action[RIGHT_ARM_SLICE], args)
             target[LEFT_ARM_SLICE] = limit_step(last_target[LEFT_ARM_SLICE], action[LEFT_ARM_SLICE], args)
+            step_diagnoses = {
+                0: diagnose_step_limit(
+                    last_target[RIGHT_ARM_SLICE],
+                    action[RIGHT_ARM_SLICE],
+                    target[RIGHT_ARM_SLICE],
+                    max_pos_step=args.max_pos_step,
+                    max_rot_step=args.max_rot_step,
+                    max_gripper_step=args.max_gripper_step,
+                ),
+                1: diagnose_step_limit(
+                    last_target[LEFT_ARM_SLICE],
+                    action[LEFT_ARM_SLICE],
+                    target[LEFT_ARM_SLICE],
+                    max_pos_step=args.max_pos_step,
+                    max_rot_step=args.max_rot_step,
+                    max_gripper_step=args.max_gripper_step,
+                ),
+            }
             if args.dry_run:
                 print(
                     f"[dry-run] timestep={timestep} "
@@ -785,7 +851,14 @@ def control_loop(
             action_summary = summarize_action(action[None, :], pose_slices=arm_slices)
             target_delta = target - last_target
             actual_error = target - actual
+            sdk_diagnoses = hardware.get_arm_status_diagnoses()
             stop_events = stop_detector.update(time.time(), target, actual, arm_slices)
+            for event in stop_events:
+                arm_idx = int(event["arm"])
+                event["diagnosis"] = merge_diagnoses(
+                    sdk_diagnoses.get(arm_idx),
+                    step_diagnoses.get(arm_idx),
+                )
             if control_trace_writer is not None:
                 control_trace_writer.write({
                     "event": "control_step",
@@ -798,11 +871,16 @@ def control_loop(
                     "target_delta": target_delta.round(5).tolist(),
                     "actual_error": actual_error.round(5).tolist(),
                     "action_summary": action_summary,
+                    "step_diagnoses": step_diagnoses,
+                    "sdk_diagnoses": sdk_diagnoses,
                     "stop_events": stop_events,
                 })
             for event in stop_events:
+                diagnosis = event.get("diagnosis", {})
                 print(
                     f"[stop-detector] arm={event['arm']} timestep={timestep} "
+                    f"reason={diagnosis.get('reason', 'other')} "
+                    f"evidence={diagnosis.get('evidence', [])} "
                     f"window={event['window_seconds']:.2f}s "
                     f"target_pos_delta={event['target_pos_delta']:.5f} "
                     f"actual_pos_delta={event['actual_pos_delta']:.5f} "

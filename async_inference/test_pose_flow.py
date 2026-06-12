@@ -10,8 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from async_inference.debug_trace import (
     StopDetector,
     collect_sdk_snapshot,
+    diagnose_piper_status,
+    diagnose_step_limit,
     find_piper_status_errors,
     find_piper_status_warnings,
+    merge_diagnoses,
     summarize_action,
 )
 from async_inference.pose_utils import (
@@ -285,6 +288,71 @@ def test_find_piper_status_errors_and_warnings_read_snapshot_str():
 
     assert find_piper_status_errors(snapshot) == ["TARGET_POS_EXCEEDS_LIMIT"]
     assert find_piper_status_warnings(snapshot) == ["REACH_TARGET_POS_FAILED"]
+
+
+def test_diagnose_piper_status_maps_no_solution_to_ik_failed():
+    snapshot = {
+        "GetArmStatus": {
+            "_str": "Arm Status: NO_SOLUTION(0x2) Motion Status: REACH_TARGET_POS_FAILED(0x1)"
+        }
+    }
+
+    diagnosis = diagnose_piper_status(snapshot)
+
+    assert diagnosis["reason"] == "ik_failed"
+    assert diagnosis["severity"] == "error"
+    assert "NO_SOLUTION" in diagnosis["errors"]
+
+
+def test_diagnose_piper_status_maps_target_limit_to_out_of_range():
+    snapshot = {
+        "GetArmStatus": {
+            "arm_status": {
+                "err_status": {
+                    "joint_3_angle_limit": True,
+                },
+            },
+            "_str": "Arm Status: TARGET_POS_EXCEEDS_LIMIT(0x4)",
+        }
+    }
+
+    diagnosis = diagnose_piper_status(snapshot)
+
+    assert diagnosis["reason"] == "out_of_range"
+    assert "TARGET_POS_EXCEEDS_LIMIT" in diagnosis["errors"]
+    assert "joint_3_angle_limit" in diagnosis["evidence"]
+
+
+def test_diagnose_step_limit_marks_clipped_action_too_fast():
+    current = np.zeros(7, dtype=np.float32)
+    requested = np.zeros(7, dtype=np.float32)
+    requested[0] = 0.05
+    limited = requested.copy()
+    limited[0] = 0.01
+
+    diagnosis = diagnose_step_limit(
+        current,
+        requested,
+        limited,
+        max_pos_step=0.01,
+        max_rot_step=0.05,
+        max_gripper_step=0.005,
+    )
+
+    assert diagnosis["reason"] == "too_fast"
+    assert "pos_step_limited" in diagnosis["evidence"]
+
+
+def test_merge_diagnoses_prefers_out_of_range_over_too_fast():
+    merged = merge_diagnoses(
+        {"reason": "too_fast", "evidence": ["pos_step_limited"], "errors": [], "warnings": []},
+        {"reason": "out_of_range", "evidence": ["joint_2_angle_limit"], "errors": ["TARGET_POS_EXCEEDS_LIMIT"], "warnings": []},
+    )
+
+    assert merged["reason"] == "out_of_range"
+    assert merged["severity"] == "error"
+    assert "pos_step_limited" in merged["evidence"]
+    assert "joint_2_angle_limit" in merged["evidence"]
 
 
 def test_action_chunk_carries_latest_action_only():
