@@ -1,4 +1,15 @@
 #!/usr/bin/env python
+"""检查 Pika 采集轨迹是否能由 Piper 机械臂 IK 到达。
+
+作用：
+    读取原始 Pika/UMI episode 的 TCP 位姿和夹爪数据，将采集轨迹映射到 Piper 默认初始 TCP 坐标系下，逐帧运行 Pinocchio IK。脚本会统计每侧 IK 成功帧数，可选导出每帧关节轨迹 npz，便于后续 RViz 播放或过滤不可达数据。
+
+使用示例：
+    python data/pika_ik.py --input-root /home/jianan/workspace/data/0616_dex --report-path /tmp/pika_ik_report.json
+
+    python data/pika_ik.py --input-root /home/jianan/workspace/data/0616_dex --episodes episode0 episode1 --include-failed-indices --trajectory-output-dir /tmp/pika_ik_traj
+"""
+
 
 from __future__ import annotations
 

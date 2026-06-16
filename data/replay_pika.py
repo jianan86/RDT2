@@ -1,4 +1,15 @@
 #!/usr/bin/env python
+"""回放原始 Pika episode 到仿真 RViz 或真实 Piper/Pika 硬件。
+
+作用：
+    从 UMI/Pika 原始数据集中读取左右手 TCP 位姿和夹爪数据，将采集轨迹转换为 Piper 机械臂可执行的目标轨迹。--mode sim 通过 ROS2 JointState 发布到 RViz 检查 IK 轨迹；--mode real 将轨迹发送到真实 Piper 机械臂和 Pika 夹爪。
+
+使用示例：
+    python data/replay_pika.py --mode sim --input-root /home/jianan/workspace/data/0616_dex --episodes episode0
+
+    python data/replay_pika.py --mode real --input-root /home/jianan/workspace/data/0616_dex --episodes episode0 --dry-run --no-piper --no-pika
+"""
+
 
 from __future__ import annotations
 
@@ -24,7 +35,6 @@ from async_inference.pose_utils import (
     mat_to_pose7d,
     tcp_pose14_to_ee_pose14,
 )
-from async_inference.real_piper_client import PiperRobot, limit_step, sleep_remaining
 from data.filter_pika_ik import (
     DEFAULT_GRIPPER_INPUT_MAX,
     DEFAULT_GRIPPER_OUTPUT_MAX,
@@ -359,6 +369,8 @@ class ReplayPikaGripper:
 
 class RealReplayHardware:
     def __init__(self, args: argparse.Namespace) -> None:
+        from async_inference.real_piper_client import PiperRobot
+
         self.args = args
         self.arm_mode = args.arm_mode
         self.arms: dict[str, PiperRobot] = {}
@@ -592,7 +604,7 @@ def replay_real_episode(
             current = last_command.get(hardware_side)
             if current is None:
                 current = hardware.read_side_tcp_pose7(hardware_side)
-            target = limit_step(current, requested, args)
+            target = limit_pose_step(current, requested, args)
             if args.dry_run:
                 print(f"[dry-run] episode={episode.name} side={replay_side_name} frame={frame_idx} target={target.round(5).tolist()}")
             else:
@@ -606,6 +618,22 @@ def first_finite_width(widths: np.ndarray) -> float:
     if finite.size == 0:
         return 0.0
     return float(finite[0])
+
+
+def limit_pose_step(current: np.ndarray, target: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    target = np.asarray(target, dtype=np.float32).copy()
+    current = np.asarray(current, dtype=np.float32)
+    target[:3] = current[:3] + np.clip(target[:3] - current[:3], -args.max_pos_step, args.max_pos_step)
+    target[3:6] = current[3:6] + np.clip(target[3:6] - current[3:6], -args.max_rot_step, args.max_rot_step)
+    target[6] = current[6] + float(np.clip(target[6] - current[6], -args.max_gripper_step, args.max_gripper_step))
+    target[6] = float(np.clip(target[6], args.min_gripper, args.max_gripper))
+    return target
+
+
+def sleep_remaining(started: float, period: float) -> None:
+    remaining = period - (time.time() - started)
+    if remaining > 0.0:
+        time.sleep(remaining)
 
 
 def pose7_to_matrix(pose7: np.ndarray) -> np.ndarray:

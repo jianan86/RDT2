@@ -10,9 +10,18 @@ from launch_ros.actions import Node
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_URDF = REPO_ROOT / "data/piper_urdf/agx_arm_description/urdf/piper_pika.urdf"
+RAW_DEFAULT_URDF = REPO_ROOT / "data/piper_urdf/agx_arm_description/urdf/piper_pika.urdf"
+DEFAULT_URDF = Path("/tmp/rdt2_piper_pika_resolved.urdf")
 DEFAULT_RVIZ = REPO_ROOT / "data/piper_urdf/rviz/pika_ik.rviz"
 DEFAULT_INPUT_ROOT = Path("/home/jianan/workspace/data/0601_dex")
+AGX_PACKAGE_ROOT = REPO_ROOT / "data/piper_urdf/agx_arm_description"
+
+
+def prepare_default_urdf() -> Path:
+    text = RAW_DEFAULT_URDF.read_text()
+    text = text.replace("package://agx_arm_description/", AGX_PACKAGE_ROOT.as_uri() + "/")
+    DEFAULT_URDF.write_text(text)
+    return DEFAULT_URDF
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -58,7 +67,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("input_root", default_value=str(DEFAULT_INPUT_ROOT)),
-            DeclareLaunchArgument("urdf", default_value=str(DEFAULT_URDF)),
+            DeclareLaunchArgument("urdf", default_value=str(prepare_default_urdf())),
             DeclareLaunchArgument("rviz_config", default_value=str(DEFAULT_RVIZ)),
             DeclareLaunchArgument("arm_mode", default_value="dual"),
             DeclareLaunchArgument("side", default_value="both"),

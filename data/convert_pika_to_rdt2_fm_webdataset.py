@@ -1,4 +1,15 @@
 #!/usr/bin/env python
+"""将 Pika/UMI 原始 episode 转换为 RDT2-FM 训练用 WebDataset。
+
+作用：
+    遍历原始数据集中的 episode，按时间戳同步相机图像、TCP 位姿和夹爪数据，生成定长 action horizon，并写出 WebDataset tar 分片、数据集元信息和任务指令。支持单臂和双臂目录结构，也支持多输入根目录合并转换。
+
+使用示例：
+    python data/convert_pika_to_rdt2_fm_webdataset.py --input-root /home/jianan/workspace/data/0616_dex --output-root /home/jianan/workspace/data/0616_dex_rdt2_fm --instruction "Pick up the object and place it into the bowl." --instruction-key 0616_dex/task0 --overwrite
+
+    python data/convert_pika_to_rdt2_fm_webdataset.py --input-root /home/jianan/workspace/data/0616_dex --max-episodes 2 --max-samples 100
+"""
+
 
 from __future__ import annotations
 
@@ -23,7 +34,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.umi.common.pose_repr_util import convert_pose_mat_rep
-from data.umi.pose_util import mat_to_pose10d
 
 
 DEFAULT_INPUT_ROOT = Path("/home/jianan/workspace/data/0601_dex")
@@ -332,6 +342,8 @@ def build_robot_action(
     gripper_input_max: float,
     gripper_output_max: float,
 ) -> np.ndarray:
+    from data.umi.pose_util import mat_to_pose10d
+
     base_pose = load_pose_matrix(base.pose)
     actions = []
     for frame in future_frames:
@@ -412,6 +424,8 @@ def build_robot_action_cached(
     gripper_input_max: float,
     gripper_output_max: float,
 ) -> np.ndarray:
+    from data.umi.pose_util import mat_to_pose10d
+
     base_pose = cached_pose_matrix(base.pose, pose_cache)
     actions = []
     for frame in future_frames:
