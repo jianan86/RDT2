@@ -29,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.convert_pika_to_rdt2_fm_webdataset import discover_episode_dirs
-from data.filter_pika_ik import (
+from data.pika_ik import (
     DEFAULT_GRIPPER_INPUT_MAX,
     DEFAULT_GRIPPER_OUTPUT_MAX,
     DEFAULT_URDF_PATH,

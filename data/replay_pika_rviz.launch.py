@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -24,45 +24,57 @@ def prepare_default_urdf() -> Path:
     return DEFAULT_URDF
 
 
-def generate_launch_description() -> LaunchDescription:
-    input_root = LaunchConfiguration("input_root")
-    urdf = LaunchConfiguration("urdf")
-    rviz_config = LaunchConfiguration("rviz_config")
-    arm_mode = LaunchConfiguration("arm_mode")
-    side = LaunchConfiguration("side")
-    fps = LaunchConfiguration("fps")
-    max_episodes = LaunchConfiguration("max_episodes")
-    max_frames = LaunchConfiguration("max_frames")
-    loop = LaunchConfiguration("loop")
-    failed_policy = LaunchConfiguration("failed_policy")
-    init_hold_sec = LaunchConfiguration("init_hold_sec")
-    publish_target_tcp = LaunchConfiguration("publish_target_tcp")
-    use_rviz = LaunchConfiguration("use_rviz")
 
-    replay_cmd = [
+def launch_value(context: object, name: str) -> str:
+    return LaunchConfiguration(name).perform(context).strip()
+
+
+def launch_bool(context: object, name: str) -> bool:
+    value = launch_value(context, name).rstrip(",").lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def make_replay_process(context: object) -> list[ExecuteProcess]:
+    episodes = launch_value(context, "episodes").rstrip(",")
+    cmd = [
         "python3",
         str(REPO_ROOT / "data/replay_pika.py"),
         "--mode",
         "sim",
         "--input-root",
-        input_root,
+        launch_value(context, "input_root"),
         "--urdf",
-        urdf,
+        launch_value(context, "urdf"),
         "--arm-mode",
-        arm_mode,
+        launch_value(context, "arm_mode"),
         "--side",
-        side,
+        launch_value(context, "side"),
         "--fps",
-        fps,
+        launch_value(context, "fps"),
         "--max-episodes",
-        max_episodes,
+        launch_value(context, "max_episodes"),
         "--max-frames",
-        max_frames,
+        launch_value(context, "max_frames"),
         "--failed-policy",
-        failed_policy,
+        launch_value(context, "failed_policy"),
         "--init-hold-sec",
-        init_hold_sec,
+        launch_value(context, "init_hold_sec"),
     ]
+    if episodes:
+        cmd.extend(["--episodes", *episodes.split()])
+    if launch_bool(context, "loop"):
+        cmd.append("--loop")
+    if launch_bool(context, "publish_target_tcp"):
+        cmd.append("--publish-target-tcp")
+    else:
+        cmd.append("--no-publish-target-tcp")
+    return [ExecuteProcess(cmd=cmd, output="screen")]
+
+
+def generate_launch_description() -> LaunchDescription:
+    urdf = LaunchConfiguration("urdf")
+    rviz_config = LaunchConfiguration("rviz_config")
+    use_rviz = LaunchConfiguration("use_rviz")
 
     return LaunchDescription(
         [
@@ -71,6 +83,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("rviz_config", default_value=str(DEFAULT_RVIZ)),
             DeclareLaunchArgument("arm_mode", default_value="dual"),
             DeclareLaunchArgument("side", default_value="both"),
+            DeclareLaunchArgument("episodes", default_value=""),
             DeclareLaunchArgument("fps", default_value="30"),
             DeclareLaunchArgument("max_episodes", default_value="1"),
             DeclareLaunchArgument("max_frames", default_value="0"),
@@ -86,26 +99,7 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 arguments=[urdf],
             ),
-            ExecuteProcess(
-                cmd=replay_cmd + ["--loop", "--publish-target-tcp"],
-                output="screen",
-                condition=IfCondition(PythonExpression(["'", loop, "' == 'true' and '", publish_target_tcp, "' == 'true'"])),
-            ),
-            ExecuteProcess(
-                cmd=replay_cmd + ["--publish-target-tcp"],
-                output="screen",
-                condition=IfCondition(PythonExpression(["'", loop, "' != 'true' and '", publish_target_tcp, "' == 'true'"])),
-            ),
-            ExecuteProcess(
-                cmd=replay_cmd + ["--loop", "--no-publish-target-tcp"],
-                output="screen",
-                condition=IfCondition(PythonExpression(["'", loop, "' == 'true' and '", publish_target_tcp, "' != 'true'"])),
-            ),
-            ExecuteProcess(
-                cmd=replay_cmd + ["--no-publish-target-tcp"],
-                output="screen",
-                condition=IfCondition(PythonExpression(["'", loop, "' != 'true' and '", publish_target_tcp, "' != 'true'"])),
-            ),
+            OpaqueFunction(function=make_replay_process),
             Node(
                 package="rviz2",
                 executable="rviz2",

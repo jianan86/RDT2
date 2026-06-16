@@ -35,7 +35,7 @@ from async_inference.pose_utils import (
     mat_to_pose7d,
     tcp_pose14_to_ee_pose14,
 )
-from data.filter_pika_ik import (
+from data.pika_ik import (
     DEFAULT_GRIPPER_INPUT_MAX,
     DEFAULT_GRIPPER_OUTPUT_MAX,
     DEFAULT_INPUT_ROOT,
