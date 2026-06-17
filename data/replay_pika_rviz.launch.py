@@ -60,8 +60,11 @@ def make_replay_process(context: object) -> list[ExecuteProcess]:
         "--init-hold-sec",
         launch_value(context, "init_hold_sec"),
     ]
+    save_joints = launch_value(context, "save_joints")
     if episodes:
         cmd.extend(["--episodes", *episodes.split()])
+    if save_joints:
+        cmd.extend(["--save-joints", save_joints])
     if launch_bool(context, "loop"):
         cmd.append("--loop")
     if launch_bool(context, "publish_target_tcp"):
@@ -90,6 +93,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("loop", default_value="false"),
             DeclareLaunchArgument("failed_policy", default_value="hold"),
             DeclareLaunchArgument("init_hold_sec", default_value="1.0"),
+            DeclareLaunchArgument("save_joints", default_value=""),
             DeclareLaunchArgument("publish_target_tcp", default_value="true"),
             DeclareLaunchArgument("use_rviz", default_value="true"),
             Node(
