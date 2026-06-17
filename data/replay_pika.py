@@ -91,6 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF_PATH)
     parser.add_argument("--topic", default="/joint_states")
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--save-joints", type=Path, help="Save simulated Piper joints and gripper widths to an .npz file.")
     parser.add_argument("--failed-policy", choices=("hold", "skip"), default="hold")
     parser.add_argument("--init-hold-sec", type=float, default=1.0)
     parser.add_argument("--publish-target-tcp", action=argparse.BooleanOptionalAction, default=True)
@@ -367,6 +368,29 @@ class ReplayPikaGripper:
         self.device.set_gripper_distance(width_mm)
 
 
+class JointTrajectoryRecorder:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.records: dict[str, list[np.ndarray]] = {}
+
+    def append(self, side: str, q: np.ndarray, gripper_width: float) -> None:
+        q = np.asarray(q, dtype=np.float32)
+        if q.shape[0] < 6:
+            raise ValueError(f"expected at least 6 joint values, got shape {q.shape}")
+        row = np.concatenate([q[:6], np.asarray([gripper_width], dtype=np.float32)], axis=0)
+        self.records.setdefault(side, []).append(row)
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        arrays = {
+            side: np.stack(rows, axis=0).astype(np.float32, copy=False)
+            for side, rows in self.records.items()
+            if rows
+        }
+        np.savez_compressed(self.path, **arrays)
+        logging.info("saved joint replay file %s with sides=%s", self.path, sorted(arrays))
+
+
 class RealReplayHardware:
     def __init__(self, args: argparse.Namespace) -> None:
         from async_inference.real_piper_client import PiperRobot
@@ -439,6 +463,8 @@ def ee_pose7_to_tcp_pose7(ee_pose7: np.ndarray) -> np.ndarray:
 def run_sim(args: argparse.Namespace, episodes: list[ReplayEpisode]) -> None:
     if args.fps <= 0.0:
         raise ValueError(f"fps must be positive, got {args.fps}")
+    if args.save_joints is not None and args.loop:
+        raise ValueError("--save-joints cannot be used with --loop")
 
     solver = PiperIkSolver(
         urdf_path=args.urdf,
@@ -449,6 +475,7 @@ def run_sim(args: argparse.Namespace, episodes: list[ReplayEpisode]) -> None:
         damp=args.damp,
     )
     player = RosJointStateReplay(args)
+    recorder = JointTrajectoryRecorder(args.save_joints) if args.save_joints is not None else None
     period = 1.0 / args.fps
     initial_q = np.concatenate(
         [
@@ -479,10 +506,12 @@ def run_sim(args: argparse.Namespace, episodes: list[ReplayEpisode]) -> None:
                         started = time.time()
                         player.publish(initial_q, base_tcp if args.publish_target_tcp else None)
                         sleep_remaining(started, period)
-                    replay_sim_side(args, solver, player, side, base_tcp, period)
+                    replay_sim_side(args, solver, player, side, base_tcp, period, recorder)
             if not args.loop:
                 break
     finally:
+        if recorder is not None:
+            recorder.save()
         player.close()
 
 
@@ -493,6 +522,7 @@ def replay_sim_side(
     side: ReplaySide,
     base_tcp: np.ndarray,
     period: float,
+    recorder: JointTrajectoryRecorder | None = None,
 ) -> None:
     targets = target_tcp_sequence(base_tcp, side.capture_tcp)
     seed = solver.q0.copy()
@@ -503,6 +533,7 @@ def replay_sim_side(
         ],
         axis=0,
     )
+    last_valid_width = 0.0
     for frame_idx, target_tcp in enumerate(targets):
         started = time.time()
         width = float(side.gripper_widths[frame_idx])
@@ -512,9 +543,14 @@ def replay_sim_side(
             seed = solution
             q = np.concatenate([solver.arm_joints_from_q(solution), gripper_width_to_joint_pair(width)], axis=0)
             last_valid = q
+            last_valid_width = width
             player.publish(q, target_tcp if args.publish_target_tcp else None)
+            if recorder is not None:
+                recorder.append(replay_side_to_hardware_side(args.arm_mode, side.side), q, width)
         elif args.failed_policy == "hold":
             player.publish(last_valid, target_tcp if args.publish_target_tcp else None)
+            if recorder is not None:
+                recorder.append(replay_side_to_hardware_side(args.arm_mode, side.side), last_valid, last_valid_width)
         else:
             logging.warning("skip frame side=%s frame=%d solved=%s width=%s", side.side, frame_idx, solved, width)
         sleep_remaining(started, period)

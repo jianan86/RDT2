@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from async_inference.pose_utils import euler_xyz_to_matrix
 from data.replay_pika import (
+    JointTrajectoryRecorder,
     gripper_width_to_joint_pair,
     normalize_args,
     target_tcp_from_capture_delta,
@@ -65,3 +66,17 @@ def test_normalize_args_treats_non_positive_limits_as_unbounded():
 
     assert normalized.max_frames is None
     assert normalized.max_episodes is None
+
+
+def test_joint_trajectory_recorder_saves_arm_joints_and_gripper_width(tmp_path):
+    path = tmp_path / "joints.npz"
+    recorder = JointTrajectoryRecorder(path)
+
+    recorder.append("right", np.arange(8, dtype=np.float32), 0.042)
+    recorder.save()
+
+    with np.load(path) as data:
+        assert data.files == ["right"]
+        assert data["right"].shape == (1, 7)
+        np.testing.assert_allclose(data["right"][0, :6], np.arange(6, dtype=np.float32))
+        np.testing.assert_allclose(data["right"][0, 6], 0.042)

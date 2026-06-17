@@ -209,7 +209,7 @@ class PiperRobot:
             "joint_ctrl_args": list(joint_args),
         }
         try:
-            event["motion_ctrl_result"] = self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
+            event["motion_ctrl_result"] = self.robot.MotionCtrl_2(0x01, 0x01, 100, 0x00)
             event["joint_ctrl_result"] = joint_ctrl(*joint_args)
         except Exception as exc:
             event["error"] = repr(exc)

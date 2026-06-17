@@ -202,7 +202,7 @@ def test_piper_execute_joints_calls_sdk_joint_ctrl():
 
     robot.execute_joints(np.array([0.0, np.pi / 2.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
 
-    assert sdk.motion_calls == [(0x01, 0x00, 100, 0x00)]
+    assert sdk.motion_calls == [(0x01, 0x01, 100, 0x00)]
     assert sdk.joint_calls == [(0, 90000, 0, 0, 0, 0)]
 
 
