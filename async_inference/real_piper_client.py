@@ -187,6 +187,55 @@ class PiperRobot:
                     f"{status_errors}"
                 )
 
+    def execute_joints(self, joints: np.ndarray) -> None:
+        if self.robot is None or self.dry_run:
+            return
+        joint_args = joint_radians_to_piper_args(joints)
+        joint_ctrl = getattr(self.robot, "JointCtrl", None)
+        if joint_ctrl is None:
+            available = sorted(
+                name for name in dir(self.robot) if "Joint" in name or "Ctrl" in name
+            )
+            raise RuntimeError(
+                f"Piper SDK does not expose JointCtrl; available control methods: {available}"
+            )
+
+        started = time.time()
+        event = {
+            "event": "piper_execute_joints",
+            "side": self.side,
+            "can_name": self.can_name,
+            "target": np.asarray(joints, dtype=np.float32).round(5).tolist(),
+            "joint_ctrl_args": list(joint_args),
+        }
+        try:
+            event["motion_ctrl_result"] = self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
+            event["joint_ctrl_result"] = joint_ctrl(*joint_args)
+        except Exception as exc:
+            event["error"] = repr(exc)
+            print(f"[piper:{self.side}] execute_joints failed: {exc}")
+            raise
+        finally:
+            event["latency_ms"] = (time.time() - started) * 1000.0
+            sdk_snapshot = collect_sdk_snapshot(self.robot)
+            event["sdk_snapshot"] = sdk_snapshot
+            status_errors = find_piper_status_errors(sdk_snapshot)
+            status_warnings = find_piper_status_warnings(sdk_snapshot)
+            sdk_diagnosis = diagnose_piper_status(sdk_snapshot)
+            self.last_sdk_diagnosis = sdk_diagnosis
+            if status_errors:
+                event["piper_status_errors"] = status_errors
+            if status_warnings:
+                event["piper_status_warnings"] = status_warnings
+            event["diagnosis"] = sdk_diagnosis
+            self._maybe_print_sdk_diagnosis(event, sdk_diagnosis)
+            if self.sdk_trace_writer is not None:
+                self.sdk_trace_writer.write(event)
+            if status_errors and self.stop_on_piper_status_error:
+                raise RuntimeError(
+                    f"Piper {self.side} status error after joint target {event['target']}: "
+                    f"{status_errors}"
+                )
 
     def get_status_diagnosis(self) -> dict:
         return dict(self.last_sdk_diagnosis)
@@ -343,6 +392,22 @@ class BimanualHardware:
         self.right_gripper.close()
         if self.left_gripper is not None:
             self.left_gripper.close()
+
+    def move_home(self, home_pos: dict[str, np.ndarray], dry_run: bool = False) -> None:
+        right_home = home_pos["right_arm"]
+        if dry_run:
+            target = np.asarray(right_home, dtype=np.float32).round(5).tolist()
+            print(f"[dry-run] home right_arm={target}")
+        self.right_arm.execute_joints(right_home)
+        if self.arm_mode == "single":
+            return
+
+        assert self.left_arm is not None
+        left_home = home_pos["left_arm"]
+        if dry_run:
+            target = np.asarray(left_home, dtype=np.float32).round(5).tolist()
+            print(f"[dry-run] home left_arm={target}")
+        self.left_arm.execute_joints(left_home)
 
     def read_tcp_pose_flat(self) -> np.ndarray:
         right_ee = np.concatenate([
@@ -720,10 +785,12 @@ def run(args) -> None:
 
     channel = grpc.insecure_channel(server)
     stub = rdt2_async_pb2_grpc.RDT2AsyncInferenceStub(channel)
-    sensors.start()
     stream = None
 
     try:
+        if args.use_home_pos:
+            hardware.move_home(args.home_pos, dry_run=args.dry_run or args.no_piper)
+        sensors.start()
         grpc.channel_ready_future(channel).result(timeout=args.connect_timeout)
         health = stub.Health(rdt2_async_pb2.HealthRequest(), timeout=args.rpc_timeout)
         print(f"[client] health ready={health.ready} message={health.message}", flush=True)
@@ -1081,6 +1148,33 @@ def adapt_action_for_arm_mode(action: np.ndarray, arm_mode: str) -> np.ndarray:
     raise ValueError(f"unsupported arm_mode: {arm_mode}")
 
 
+def joint_radians_to_piper_args(joints: np.ndarray) -> tuple[int, int, int, int, int, int]:
+    joints = np.asarray(joints, dtype=np.float32)
+    if joints.shape != (6,):
+        raise ValueError(f"expected 6 Piper joint values, got shape {joints.shape}")
+    return tuple(int(round(float(np.degrees(value)) * 1000.0)) for value in joints)
+
+
+def parse_home_pos_config(raw_home_pos, *, arm_mode: str, required: bool) -> dict[str, np.ndarray] | None:
+    if raw_home_pos is None:
+        if required:
+            raise ValueError("--use-home-pos requires hardware config key 'home-pos'")
+        return None
+    if not isinstance(raw_home_pos, dict):
+        raise ValueError("hardware config key 'home-pos' must be a mapping")
+
+    required_keys = ("right_arm",) if arm_mode == "single" else ("right_arm", "left_arm")
+    parsed = {}
+    for key in required_keys:
+        if key not in raw_home_pos:
+            raise ValueError(f"hardware config key 'home-pos.{key}' is required for arm_mode={arm_mode}")
+        value = np.asarray(raw_home_pos[key], dtype=np.float32)
+        if value.shape != (6,):
+            raise ValueError(f"hardware config key 'home-pos.{key}' must contain 6 joint values, got {value.tolist()}")
+        parsed[key] = value
+    return parsed
+
+
 def blend_pose14(old: np.ndarray, new: np.ndarray, alpha: float) -> np.ndarray:
     out = (1.0 - alpha) * old + alpha * new
     for arm_slice in (RIGHT_ARM_SLICE, LEFT_ARM_SLICE):
@@ -1114,6 +1208,11 @@ def apply_hardware_config(args: argparse.Namespace) -> argparse.Namespace:
     fill("left_fisheye_index", "left", "fisheye_index", 1)
     args.right_fisheye_device = args.right_fisheye_device or int(args.right_fisheye_index)
     args.left_fisheye_device = args.left_fisheye_device or int(args.left_fisheye_index)
+    args.home_pos = parse_home_pos_config(
+        cfg.get("home-pos"),
+        arm_mode=args.arm_mode,
+        required=args.use_home_pos,
+    )
     return args
 
 def parse_args() -> argparse.Namespace:
@@ -1126,6 +1225,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-port", default=0, type=int)
     parser.add_argument("--no-tunnel", action="store_true")
     parser.add_argument("--hardware-config", default="configs/robots/eval_bimanual_piper_pika_config.yaml")
+    parser.add_argument(
+        "--use-home-pos",
+        action="store_true",
+        help="move Piper arms to hardware-config home-pos before inference",
+    )
     parser.add_argument("--arm-mode", choices=("dual", "single"), default="dual")
     parser.add_argument("--right-piper-can", default=None)
     parser.add_argument("--left-piper-can", default=None)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -27,8 +28,11 @@ from async_inference.pose_utils import (
 from async_inference.proto import rdt2_async_pb2
 from async_inference.real_piper_client import (
     ActionQueue,
+    PiperRobot,
     adapt_action_for_arm_mode,
+    apply_hardware_config,
     duplicate_single_arm_pose14,
+    joint_radians_to_piper_args,
     preprocess_fisheye,
 )
 from async_inference.server import RDT2AsyncService
@@ -99,6 +103,107 @@ def test_adapt_action_for_dual_arm_leaves_action_unchanged():
     adapted = adapt_action_for_arm_mode(action, "dual")
 
     assert adapted is action
+
+
+def make_hardware_args(
+    config_path: Path,
+    *,
+    use_home_pos: bool = True,
+    arm_mode: str = "dual",
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        hardware_config=str(config_path),
+        use_home_pos=use_home_pos,
+        arm_mode=arm_mode,
+        right_piper_can=None,
+        left_piper_can=None,
+        right_gripper_port=None,
+        left_gripper_port=None,
+        right_fisheye_device=None,
+        left_fisheye_device=None,
+        right_fisheye_index=None,
+        left_fisheye_index=None,
+    )
+
+
+def test_apply_hardware_config_reads_home_pos(tmp_path):
+    config = tmp_path / "hardware.yaml"
+    config.write_text(
+        "right:\n"
+        "  piper_can: right_can\n"
+        "left:\n"
+        "  piper_can: left_can\n"
+        "home-pos:\n"
+        "  right_arm: [0.0, 0.44, -0.257, 0.0, 0.27, 0.0]\n"
+        "  left_arm: [1.0, 0.44, -0.257, 0.0, 0.27, 0.0]\n"
+    )
+
+    args = apply_hardware_config(make_hardware_args(config))
+
+    assert args.right_piper_can == "right_can"
+    np.testing.assert_allclose(
+        args.home_pos["right_arm"],
+        [0.0, 0.44, -0.257, 0.0, 0.27, 0.0],
+    )
+    np.testing.assert_allclose(
+        args.home_pos["left_arm"],
+        [1.0, 0.44, -0.257, 0.0, 0.27, 0.0],
+    )
+
+
+def test_apply_hardware_config_requires_home_pos_when_enabled(tmp_path):
+    config = tmp_path / "hardware.yaml"
+    config.write_text("right:\n  piper_can: right_can\n")
+
+    try:
+        apply_hardware_config(make_hardware_args(config, use_home_pos=True))
+    except ValueError as exc:
+        assert "home-pos" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_joint_radians_to_piper_args_uses_millidegrees():
+    joints = np.array([0.0, np.pi / 2.0, -np.pi / 2.0, np.pi, -np.pi, 0.001], dtype=np.float32)
+
+    assert joint_radians_to_piper_args(joints) == (0, 90000, -90000, 180000, -180000, 57)
+
+
+def test_piper_execute_joints_calls_sdk_joint_ctrl():
+    class FakeSdk:
+        def __init__(self):
+            self.motion_calls = []
+            self.joint_calls = []
+
+        def MotionCtrl_2(self, *args):
+            self.motion_calls.append(args)
+            return "motion-ok"
+
+        def JointCtrl(self, *args):
+            self.joint_calls.append(args)
+            return "joint-ok"
+
+    sdk = FakeSdk()
+    robot = PiperRobot.__new__(PiperRobot)
+    robot.side = "right"
+    robot.can_name = "right_can"
+    robot.dry_run = False
+    robot.sdk_trace_writer = None
+    robot.stop_on_piper_status_error = False
+    robot.last_sdk_diagnosis = {
+        "reason": "none",
+        "severity": "none",
+        "errors": [],
+        "warnings": [],
+        "evidence": [],
+    }
+    robot._last_printed_status_key = None
+    robot.robot = sdk
+
+    robot.execute_joints(np.array([0.0, np.pi / 2.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
+
+    assert sdk.motion_calls == [(0x01, 0x00, 100, 0x00)]
+    assert sdk.joint_calls == [(0, 90000, 0, 0, 0, 0)]
 
 
 def test_action_queue_prefix_no_merge_requires_positive_prefix_steps():
